@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.90"
 description = "Folder file counts from Everything ESDb 1.7.20"
 license = "MIT"
+autotests = false
 
 [dependencies]
 anyhow = "1"

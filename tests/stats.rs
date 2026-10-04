@@ -3,6 +3,7 @@ use crate::database::{Counts, Directory};
 
 fn options(recursive: bool, top: usize) -> StatsOptions {
     StatsOptions {
+        command: None,
         path: None,
         top: NonZeroUsize::new(top).unwrap(),
         database: None,
@@ -149,6 +150,18 @@ fn rejects_corruption_and_unrelated_sqlite_cache() {
     db.execute_batch("CREATE TABLE important(data TEXT)")
         .unwrap();
     assert!(cache::schema(&db).is_err());
+}
+
+#[test]
+fn update_checks_source_timestamp_without_taking_the_path() {
+    use clap::Parser;
+    let update = StatsOptions::parse_from(["es-stats", "update", "--db", "x.db"]);
+    assert!(matches!(update.command, Some(Command::Update)));
+    assert!(update.path.is_none());
+    assert_eq!(update.database.unwrap(), PathBuf::from("x.db"));
+    let query = StatsOptions::parse_from(["es-stats", r"C:\Users"]);
+    assert!(query.command.is_none());
+    assert_eq!(utc(std::time::UNIX_EPOCH).unwrap(), "1970-01-01 00:00:00Z");
 }
 
 #[test]

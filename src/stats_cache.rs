@@ -85,10 +85,10 @@ pub(super) fn metadata(connection: &Connection) -> Result<Option<(Vec<u8>, i64)>
         .optional()?)
 }
 
-pub(super) fn ensure(connection: &mut Connection, database: &Path) -> Result<()> {
+pub(super) fn ensure(connection: &mut Connection, database: &Path) -> Result<bool> {
     let snapshot = fingerprint(database)?;
     if metadata(connection)?.is_some_and(|(previous, _)| previous == snapshot) {
-        return Ok(());
+        return Ok(false);
     }
     eprintln!("Building file-count cache from {}...", database.display());
     let start = Instant::now();
@@ -102,7 +102,7 @@ pub(super) fn ensure(connection: &mut Connection, database: &Path) -> Result<()>
         "Cached {directories} directories in {:.2}s",
         start.elapsed().as_secs_f64()
     );
-    Ok(())
+    Ok(true)
 }
 
 pub(super) fn store(connection: &mut Connection, snapshot: &[u8], counts: Counts) -> Result<()> {

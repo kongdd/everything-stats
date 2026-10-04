@@ -1,9 +1,10 @@
 // Adapted from nasfind/src/stats.rs (MIT); count files, not directory entries.
 use std::{
-    env,
+    env, fs,
     io::{self, BufWriter, Write},
     num::NonZeroUsize,
     path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -14,26 +15,38 @@ mod cache;
 #[derive(clap::Parser, Debug)]
 #[command(
     version,
-    about = "Rank folders by indexed file count; no disk traversal"
+    about = "Rank folders by indexed file count; no disk traversal",
+    subcommand_precedence_over_arg = true
 )]
 pub struct StatsOptions {
+    #[command(subcommand)]
+    pub command: Option<Command>,
     /// Restrict ranking to this subtree (use the indexed spelling).
     pub path: Option<PathBuf>,
     /// Number of results.
     #[arg(short = 'n', long = "top", default_value = "10")]
     pub top: NonZeroUsize,
     /// Everything.db; defaults to %LOCALAPPDATA%\Everything\Everything.db.
-    #[arg(short = 'd', long = "db")]
+    #[arg(short = 'd', long = "db", global = true)]
     pub database: Option<PathBuf>,
     /// SQLite cache; defaults to %LOCALAPPDATA%\es-stats\stats.db.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub cache: Option<PathBuf>,
     /// Include descendants; false counts directly contained files only.
     #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
     pub recursive: bool,
 }
 
+#[derive(clap::Subcommand, Debug)]
+pub enum Command {
+    /// Rebuild stats.db if Everything.db path, size, or mtime changed.
+    Update,
+}
+
 pub fn stats(database: &Path, options: &StatsOptions) -> Result<()> {
+    if matches!(options.command, Some(Command::Update)) {
+        return refresh(database, options);
+    }
     let root = options.path.as_deref().map(absolute_path).transpose()?;
     let cache_path = options.cache.clone().map_or_else(default_cache, Ok)?;
     let mut connection = cache::open(database, &cache_path)?;
@@ -71,6 +84,53 @@ pub fn stats(database: &Path, options: &StatsOptions) -> Result<()> {
 struct Rank {
     count: i64,
     path: Vec<u8>,
+}
+
+fn refresh(database: &Path, options: &StatsOptions) -> Result<()> {
+    let cache_path = options.cache.clone().map_or_else(default_cache, Ok)?;
+    let meta = fs::metadata(database)
+        .with_context(|| format!("cannot open {}", database.display()))?;
+    eprintln!(
+        "{}  {}  {} bytes",
+        database.display(),
+        utc(meta.modified()?)?,
+        meta.len()
+    );
+    let mut connection = cache::open(database, &cache_path)?;
+    let rebuilt = cache::ensure(&mut connection, database)?;
+    eprintln!(
+        "{}  {}",
+        cache_path.display(),
+        if rebuilt { "updated" } else { "current" }
+    );
+    Ok(())
+}
+
+// ponytail: UTC, post-1970; switch to local time if a clock crate is added.
+fn utc(time: SystemTime) -> Result<String> {
+    let secs = time.duration_since(UNIX_EPOCH)?.as_secs();
+    let (y, m, d) = civil(secs / 86400);
+    let t = secs % 86400;
+    Ok(format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}Z",
+        t / 3600,
+        t / 60 % 60,
+        t % 60
+    ))
+}
+
+fn civil(z: u64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
 }
 
 fn default_cache() -> Result<PathBuf> {
