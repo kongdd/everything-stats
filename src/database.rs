@@ -68,7 +68,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub(crate) fn collect(path: &Path, live: bool) -> Result<Counts> {
+pub(crate) fn collect(path: &Path, live: bool, extensions: Option<&str>) -> Result<Counts> {
     let data = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
     if data.get(..8) == Some(b"ESDb\x32\x00\x07\x01") {
         ensure!(
@@ -76,14 +76,14 @@ pub(crate) fn collect(path: &Path, live: bool) -> Result<Counts> {
             "ESDb 1.7.50 requires the running Everything 1.5 index; omit --db"
         );
         #[cfg(windows)]
-        return crate::sdk::collect();
+        return crate::sdk::collect(extensions);
         #[cfg(not(windows))]
         bail!("Everything SDK3 requires Windows");
     }
-    parse(&data)
+    parse(&data, extensions)
 }
 
-pub(crate) fn parse(data: &[u8]) -> Result<Counts> {
+pub(crate) fn parse(data: &[u8], extensions: Option<&str>) -> Result<Counts> {
     let mut r = Reader { data, position: 0 };
     ensure!(
         r.take(4)? == b"ESDb" && r.integer()? == 0x01070014,
@@ -179,7 +179,18 @@ pub(crate) fn parse(data: &[u8]) -> Result<Counts> {
         ensure!(parent < folders, "file must reference an indexed folder");
         r.name(&mut previous)?;
         r.take(file_width)?;
-        direct[parent] += 1;
+        if extensions.is_none_or(|extensions| {
+            previous
+                .iter()
+                .rposition(|&byte| byte == b'.')
+                .is_some_and(|dot| {
+                    extensions.split(',').any(|extension| {
+                        previous[dot + 1..].eq_ignore_ascii_case(extension.as_bytes())
+                    })
+                })
+        }) {
+            direct[parent] += 1;
+        }
     }
     for kind in [0, 3] {
         let count = r.integer()?;
@@ -213,6 +224,7 @@ pub(crate) fn parse(data: &[u8]) -> Result<Counts> {
         r.position
     );
 
+    let total = direct.iter().sum();
     // Use native DB IDs: no path interning, re-parsing, or file-path materialization.
     let mut nodes: Vec<_> = names
         .into_iter()
@@ -239,8 +251,5 @@ pub(crate) fn parse(data: &[u8]) -> Result<Counts> {
             nodes[parent].recursive += nodes[id].recursive;
         }
     }
-    Ok(Counts {
-        nodes,
-        total: files as i64,
-    })
+    Ok(Counts { nodes, total })
 }

@@ -97,7 +97,7 @@ pub(super) fn ensure(
     }
     eprintln!("Building file-count cache from {}...", database.display());
     let start = Instant::now();
-    let counts = crate::database::collect(database, live)?;
+    let counts = crate::database::collect(database, live, None)?;
     if fingerprint(database)? != snapshot {
         bail!("Everything.db changed while building statistics; retry the command");
     }

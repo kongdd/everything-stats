@@ -5,6 +5,7 @@ fn options(recursive: bool, top: usize) -> StatsOptions {
     StatsOptions {
         command: None,
         path: None,
+        extensions: None,
         top: NonZeroUsize::new(top).unwrap(),
         database: None,
         cache: Some("unused.db".into()),
@@ -103,7 +104,7 @@ fn fixture(kind: u8, flags: u32, files: u32) -> (Vec<u8>, usize) {
 fn parses_everything_and_caches_both_file_count_modes() {
     for kind in [0, 2] {
         let (data, _) = fixture(kind, 0x6525, 4);
-        let counts = crate::database::parse(&data).unwrap();
+        let counts = crate::database::parse(&data, None).unwrap();
         assert_eq!(counts.total, 4);
         assert_eq!(
             counts
@@ -129,13 +130,15 @@ fn parses_everything_and_caches_both_file_count_modes() {
     }
     // Equal folder/file counts must not confuse which sort tables are present.
     assert_eq!(
-        crate::database::parse(&fixture(2, 0x4101, 3).0)
+        crate::database::parse(&fixture(2, 0x4101, 3).0, None)
             .unwrap()
             .total,
         3
     );
     assert_eq!(
-        crate::database::parse(&fixture(2, 1, 0).0).unwrap().total,
+        crate::database::parse(&fixture(2, 1, 0).0, None)
+            .unwrap()
+            .total,
         0
     );
 }
@@ -143,13 +146,98 @@ fn parses_everything_and_caches_both_file_count_modes() {
 #[test]
 fn rejects_corruption_and_unrelated_sqlite_cache() {
     let (mut data, parent) = fixture(2, 0x6525, 4);
-    assert!(crate::database::parse(&data[..data.len() - 1]).is_err());
+    assert!(crate::database::parse(&data[..data.len() - 1], None).is_err());
     data[parent..parent + 4].copy_from_slice(&0_u32.to_le_bytes());
-    assert!(crate::database::parse(&data).is_err());
+    assert!(crate::database::parse(&data, None).is_err());
     let db = rusqlite::Connection::open_in_memory().unwrap();
     db.execute_batch("CREATE TABLE important(data TEXT)")
         .unwrap();
     assert!(cache::schema(&db).is_err());
+}
+
+#[test]
+fn accepts_comma_separated_extensions_and_rejects_invalid_filters() {
+    use clap::Parser;
+    let options = StatsOptions::try_parse_from(["es-stats", "d:", "exts:PDF,docx"]).unwrap();
+    assert_eq!(options.path.unwrap(), PathBuf::from("d:"));
+    assert_eq!(options.extensions.as_deref(), Some("pdf,docx"));
+    for filter in [
+        "exts:",
+        "exts:pdf,",
+        "exts:pdf;docx",
+        "exts:pdf,*.docx",
+        "pdf,docx",
+    ] {
+        assert!(StatsOptions::try_parse_from(["es-stats", "d:", filter]).is_err());
+    }
+}
+
+#[test]
+fn filters_old_database_by_suffix_without_changing_all_file_counts() {
+    let (mut data, _) = fixture(2, 0x6525, 4);
+    let offsets: Vec<_> = data
+        .windows(8)
+        .enumerate()
+        .filter_map(|(i, bytes)| (bytes == b"file.txt").then_some(i))
+        .collect();
+    assert_eq!(offsets.len(), 2);
+    data[offsets[0]..offsets[0] + 8].copy_from_slice(b"file.PDF");
+    data[offsets[1]..offsets[1] + 8].copy_from_slice(b"one.docx");
+    let counts = crate::database::parse(&data, Some("pdf,docx,pdf")).unwrap();
+    assert_eq!(counts.total, 2);
+    let mut db = rusqlite::Connection::open_in_memory().unwrap();
+    cache::store(&mut db, b"filtered", counts).unwrap();
+    assert_eq!(cache::total(&db, b"Q:").unwrap(), 2);
+    assert_eq!(cache::total(&db, b"Q:\\A").unwrap(), 1);
+    assert_eq!(cache::total(&db, b"Q:\\A\\B").unwrap(), 0);
+    let rows = cache::ranked(&db, &options(true, 10), None).unwrap();
+    assert_eq!(rows.iter().map(|row| row.count).collect::<Vec<_>>(), [2, 1]);
+    let rows = cache::ranked(&db, &options(false, 10), Some(b"Q:\\A")).unwrap();
+    assert_eq!(
+        rows,
+        [Rank {
+            path: b"Q:\\A".to_vec(),
+            count: 1
+        }]
+    );
+    assert_eq!(
+        crate::database::parse(&data, Some("pptx")).unwrap().total,
+        0
+    );
+    assert_eq!(crate::database::parse(&data, None).unwrap().total, 4);
+}
+
+#[test]
+fn filtered_query_does_not_touch_the_persistent_cache() {
+    let source = env::temp_dir().join(format!("es-stats-exts-{}.db", std::process::id()));
+    let persistent = source.with_extension("cache");
+    fs::write(&source, fixture(2, 1, 4).0).unwrap();
+    fs::write(&persistent, b"leave this cache untouched").unwrap();
+    let mut options = options(true, 10);
+    options.database = Some(source.clone());
+    options.cache = Some(persistent.clone());
+    options.extensions = Some("txt".into());
+    options.path = Some("Q:".into());
+    stats(&source, &options).unwrap();
+    assert_eq!(
+        fs::read(&persistent).unwrap(),
+        b"leave this cache untouched"
+    );
+    fs::remove_file(source).unwrap();
+    fs::remove_file(persistent).unwrap();
+}
+
+#[test]
+fn recycle_bin_cleanup_needs_no_database_or_query_path() {
+    use clap::Parser;
+    let options = StatsOptions::try_parse_from(["es-stats", "clean"]).unwrap();
+    let legacy = StatsOptions::try_parse_from(["es-stats", "clean-recycle-bin"]).unwrap();
+    assert!(matches!(legacy.command, Some(Command::CleanRecycleBin)));
+    assert!(matches!(options.command, Some(Command::CleanRecycleBin)));
+    assert!(options.path.is_none());
+    assert!(options.database.is_none());
+    assert!(options.cache.is_none());
+    assert!(StatsOptions::try_parse_from(["es-stats", "clean", r"C:\"]).is_err());
 }
 
 #[test]
@@ -232,13 +320,13 @@ fn windows_paths_and_raw_name_bytes_are_preserved() {
 fn failed_replacement_keeps_previous_cache_intact() {
     let mut db = rusqlite::Connection::open_in_memory().unwrap();
     cache::schema(&db).unwrap();
-    let counts = crate::database::parse(&fixture(2, 1, 4).0).unwrap();
+    let counts = crate::database::parse(&fixture(2, 1, 4).0, None).unwrap();
     cache::store(&mut db, b"old", counts).unwrap();
     db.execute_batch(
         "CREATE TRIGGER fail BEFORE INSERT ON counts BEGIN SELECT RAISE(ABORT, 'fail'); END;",
     )
     .unwrap();
-    let replacement = crate::database::parse(&fixture(2, 1, 4).0).unwrap();
+    let replacement = crate::database::parse(&fixture(2, 1, 4).0, None).unwrap();
     assert!(cache::store(&mut db, b"new", replacement).is_err());
     let (snapshot, total) = cache::metadata(&db).unwrap().unwrap();
     assert_eq!(snapshot, b"old");
@@ -274,7 +362,7 @@ fn replaces_owned_v1_cache_transactionally() {
     .unwrap();
     cache::schema(&db).unwrap();
     assert!(cache::metadata(&db).unwrap().is_none());
-    let counts = crate::database::parse(&fixture(2, 1, 4).0).unwrap();
+    let counts = crate::database::parse(&fixture(2, 1, 4).0, None).unwrap();
     cache::store(&mut db, b"new", counts).unwrap();
     assert_eq!(cache::metadata(&db).unwrap().unwrap(), (b"new".to_vec(), 4));
     cache::schema(&db).unwrap();

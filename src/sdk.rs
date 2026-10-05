@@ -1,5 +1,9 @@
 //! Everything 1.5: query indexed folder counts through the official SDK3.
-use std::{collections::HashMap, ffi::c_void, ptr};
+use std::{
+    collections::HashMap,
+    ffi::{CString, c_void},
+    ptr,
+};
 
 use anyhow::{Context, Result, ensure};
 
@@ -53,20 +57,30 @@ impl Drop for Handle {
     }
 }
 
-pub(crate) fn collect() -> Result<Counts> {
+pub(crate) fn collect(extensions: Option<&str>) -> Result<Counts> {
     // SAFETY: calls use owned SDK handles and appropriately sized output buffers.
     unsafe {
         let client = Handle::new(Everything3_ConnectW(ptr::null()), Everything3_DestroyClient)
-            .context("start the default Everything 1.5 instance before rebuilding the cache")?;
+            .context("start the default Everything 1.5 instance before querying its index")?;
         let search = Handle::new(
             Everything3_CreateSearchState(),
             Everything3_DestroySearchState,
         )?;
+        let query = CString::new(extensions.map_or_else(
+            || "folder:".to_string(),
+            |extensions| format!("file: ext:{}", extensions.replace(',', ";")),
+        ))?;
+        let path_property = if extensions.is_some() { 1 } else { PATH }; // 1 = parent path.
         ensure!(
-            Everything3_SetSearchTextUTF8(search.0, c"folder:".as_ptr().cast()) != 0,
-            "cannot set SDK3 folder query"
+            Everything3_SetSearchTextUTF8(search.0, query.as_ptr().cast()) != 0,
+            "cannot set SDK3 query"
         );
-        for property in [PATH, DIRECT, RECURSIVE] {
+        let properties: &[u32] = if extensions.is_some() {
+            &[1]
+        } else {
+            &[PATH, DIRECT, RECURSIVE]
+        };
+        for &property in properties {
             ensure!(
                 Everything3_AddSearchPropertyRequest(search.0, property) != 0,
                 "cannot request SDK3 property {property}"
@@ -78,13 +92,19 @@ pub(crate) fn collect() -> Result<Counts> {
         )?;
         let count = Everything3_GetResultListViewportCount(results.0);
         ensure!(count != usize::MAX, "cannot read SDK3 result count");
-        let mut nodes = Vec::with_capacity(count);
+        let mut nodes = Vec::with_capacity(if extensions.is_none() { count } else { 0 });
+        let mut direct = HashMap::new();
         for index in 0..count {
-            let length =
-                Everything3_GetResultPropertyTextUTF8(results.0, index, PATH, ptr::null_mut(), 0);
+            let length = Everything3_GetResultPropertyTextUTF8(
+                results.0,
+                index,
+                path_property,
+                ptr::null_mut(),
+                0,
+            );
             ensure!(
                 length > 0 && length < isize::MAX as usize,
-                "invalid SDK3 folder path length"
+                "invalid SDK3 path length"
             );
             // The size query includes NUL; the copy returns bytes excluding NUL.
             let mut path = vec![0; length];
@@ -92,15 +112,19 @@ pub(crate) fn collect() -> Result<Counts> {
                 Everything3_GetResultPropertyTextUTF8(
                     results.0,
                     index,
-                    PATH,
+                    path_property,
                     path.as_mut_ptr(),
                     path.len()
                 ) == length - 1,
-                "cannot read SDK3 folder path"
+                "cannot read SDK3 path"
             );
             path.truncate(length - 1);
             while path.last() == Some(&b'\\') {
                 path.pop();
+            }
+            if extensions.is_some() {
+                *direct.entry(path).or_insert(0_i64) += 1;
+                continue;
             }
             nodes.push(Directory {
                 parent: None,
@@ -115,8 +139,40 @@ pub(crate) fn collect() -> Result<Counts> {
                 .context("invalid SDK3 recursive file count")?,
             });
         }
-        hierarchy(nodes)
+        if extensions.is_some() {
+            filtered_counts(direct)
+        } else {
+            hierarchy(nodes)
+        }
     }
+}
+
+fn filtered_counts(direct: HashMap<Vec<u8>, i64>) -> Result<Counts> {
+    let mut nodes = HashMap::new();
+    for (path, count) in direct {
+        let mut current = path.as_slice();
+        loop {
+            let node = nodes.entry(current.to_vec()).or_insert(Directory {
+                parent: None,
+                path: current.to_vec(),
+                direct: 0,
+                recursive: 0,
+            });
+            if current == path {
+                node.direct += count;
+            }
+            node.recursive += count;
+            let Some(end) = current.iter().rposition(|&byte| byte == b'\\') else {
+                break;
+            };
+            // A UNC share is a root: do not invent \\server or empty ancestors.
+            if current.starts_with(b"\\\\") && !current[2..end].contains(&b'\\') {
+                break;
+            }
+            current = &current[..end];
+        }
+    }
+    hierarchy(nodes.into_values().collect())
 }
 
 fn hierarchy(mut nodes: Vec<Directory>) -> Result<Counts> {
@@ -160,6 +216,26 @@ fn hierarchy(mut nodes: Vec<Directory>) -> Result<Counts> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filtered_counts_include_ancestors_but_stop_at_volume_and_unc_roots() {
+        let counts = filtered_counts(HashMap::from([
+            (b"Q:\\A\\B".to_vec(), 2),
+            (b"Q:\\A".to_vec(), 1),
+            (b"Q:".to_vec(), 1),
+            (br"\\server\share\docs".to_vec(), 3),
+        ]))
+        .unwrap();
+        assert_eq!(counts.total, 7);
+        let get = |path: &[u8]| counts.nodes.iter().find(|node| node.path == path).unwrap();
+        assert_eq!(get(b"Q:").recursive, 4);
+        assert_eq!(get(b"Q:\\A").direct, 1);
+        assert_eq!(get(b"Q:\\A").recursive, 3);
+        assert_eq!(get(br"\\server\share").recursive, 3);
+        assert!(get(br"\\server\share").parent.is_none());
+        assert_eq!(counts.nodes.len(), 5);
+        assert!(filtered_counts(HashMap::new()).unwrap().nodes.is_empty());
+    }
 
     #[test]
     fn resolves_child_before_parent_and_checks_counts() {

@@ -23,6 +23,9 @@ pub struct StatsOptions {
     pub command: Option<Command>,
     /// Restrict ranking to this subtree (use the indexed spelling).
     pub path: Option<PathBuf>,
+    /// Filter files by extensions, e.g. exts:pdf,docx.
+    #[arg(value_parser = parse_extensions)]
+    pub extensions: Option<String>,
     /// Number of results.
     #[arg(short = 'n', long = "top", default_value = "10")]
     pub top: NonZeroUsize,
@@ -39,6 +42,9 @@ pub struct StatsOptions {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
+    /// Empty the current user's Recycle Bin on all drives (Windows confirmation required).
+    #[command(name = "clean", alias = "clean-recycle-bin")]
+    CleanRecycleBin,
     /// Save the running Everything index, then refresh stats.db.
     Update {
         /// Rebuild even when the source fingerprint matches.
@@ -52,9 +58,23 @@ pub fn stats(database: &Path, options: &StatsOptions) -> Result<()> {
         return refresh(database, options, force);
     }
     let root = options.path.as_deref().map(absolute_path).transpose()?;
-    let cache_path = options.cache.clone().map_or_else(default_cache, Ok)?;
-    let mut connection = cache::open(database, &cache_path)?;
-    cache::ensure(&mut connection, database, false, options.database.is_none())?;
+    // Filtered counts stay in memory and never replace the all-file cache.
+    let mut connection = if let Some(extensions) = options.extensions.as_deref() {
+        let snapshot = cache::fingerprint(database)?;
+        let counts =
+            crate::database::collect(database, options.database.is_none(), Some(extensions))?;
+        if cache::fingerprint(database)? != snapshot {
+            bail!("Everything.db changed while filtering statistics; retry the command");
+        }
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        cache::store(&mut connection, &snapshot, counts)?;
+        connection
+    } else {
+        let cache_path = options.cache.clone().map_or_else(default_cache, Ok)?;
+        let mut connection = cache::open(database, &cache_path)?;
+        cache::ensure(&mut connection, database, false, options.database.is_none())?;
+        connection
+    };
     // Keep the totals and rankings in one SQLite read snapshot during refreshes.
     let transaction = connection.transaction()?;
     let (snapshot, all_files) = cache::metadata(&transaction)?.context("empty statistics cache")?;
@@ -153,6 +173,19 @@ fn civil(z: u64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m as u32, d as u32)
+}
+
+fn parse_extensions(value: &str) -> std::result::Result<String, String> {
+    let extensions = value.strip_prefix("exts:").ok_or("use exts:pdf,docx")?;
+    if !extensions.split(',').all(|extension| {
+        !extension.is_empty()
+            && extension
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }) {
+        return Err("extensions must be nonempty names separated by ','".into());
+    }
+    Ok(extensions.to_ascii_lowercase())
 }
 
 fn default_cache() -> Result<PathBuf> {
