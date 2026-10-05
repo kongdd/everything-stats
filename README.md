@@ -16,7 +16,8 @@ es-stats update
 es-stats update -f
 ```
 
-- `update`：检查 Everything.db 的修改时间（及路径、长度）；不一致则重建 stats.db，不输出排名。`-f` 强制重建。
+- `update`：调用 `%ProgramFiles%\Everything\Everything.exe -no-first-instance -save-db-now`，让正在运行的默认实例保存索引，再检查源库并更新 stats.db；不退出、不重启。需要 Everything 1.5 安装在标准目录；未运行时仅更新已有磁盘快照。`-f` 强制重建统计缓存。
+- 显式指定 `--db` 时只更新该磁盘快照，不调用 Everything。
 - `--db` / `-d`：源数据库，默认 `%LOCALAPPDATA%\Everything\Everything.db`。
 - `--cache`：SQLite 缓存，默认 `%LOCALAPPDATA%\es-stats\stats.db`，不向当前目录写入。
 - `--recursive true`：默认；文件数包含所有后代目录中的文件。
@@ -55,7 +56,7 @@ cargo clippy -- -D warnings
 cargo build --release
 ```
 
-6 项测试覆盖 NTFS／文件夹来源、非拓扑父索引、中文和重复名称、两种计数、子树排名、异常输入、原始名称字节、缓存失败回滚、旧缓存升级，以及用户缓存路径和小写盘符。
+测试覆盖 NTFS／文件夹来源、非拓扑父索引、中文和重复名称、两种计数、子树排名、异常输入、原始名称字节、缓存失败回滚、旧缓存升级，以及用户缓存路径和小写盘符。
 
 本机全库验证：**1,046,436 个目录，8,228,251 条文件记录**；10 个盘符总数与原解析器一致，全部目录满足“递归数＝直接数＋子目录递归数”，SQLite 完整性检查通过。
 主体代码由 **706 行减至 567 行**（约减少 20%），删除 `serde_json` 依赖。全部目录的路径、直接计数与递归计数经 SHA-256 对照与精简前一致。

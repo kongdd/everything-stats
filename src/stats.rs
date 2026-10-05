@@ -39,7 +39,7 @@ pub struct StatsOptions {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
-    /// Rebuild stats.db if Everything.db path, size, or mtime changed.
+    /// Save the running Everything index, then refresh stats.db.
     Update {
         /// Rebuild even when the source fingerprint matches.
         #[arg(short, long)]
@@ -91,6 +91,23 @@ struct Rank {
 }
 
 fn refresh(database: &Path, options: &StatsOptions, force: bool) -> Result<()> {
+    // Explicit --db means an offline snapshot: leave Everything alone.
+    #[cfg(windows)]
+    if options.database.is_none() {
+        let executable =
+            PathBuf::from(env::var_os("ProgramFiles").context("ProgramFiles is not set")?)
+                .join("Everything/Everything.exe");
+        let status = std::process::Command::new(&executable)
+            .args(["-no-first-instance", "-save-db-now"])
+            .status()
+            .with_context(|| {
+                format!(
+                    "cannot run {} (requires Everything 1.5)",
+                    executable.display()
+                )
+            })?;
+        anyhow::ensure!(status.success(), "Everything failed to save its database");
+    }
     let cache_path = options.cache.clone().map_or_else(default_cache, Ok)?;
     let meta =
         fs::metadata(database).with_context(|| format!("cannot open {}", database.display()))?;
