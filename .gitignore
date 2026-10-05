@@ -5,3 +5,5 @@ target
 *.pdf
 *.zip
 everything_sdk3
+
+*.png
