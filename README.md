@@ -13,9 +13,10 @@ es-stats 'C:\Users' -n 20
 es-stats 'Z:\GitHub' --recursive false -n 20
 es-stats --db '..\data\Everything.snapshot.db'
 es-stats update
+es-stats update -f
 ```
 
-- `update`：检查 Everything.db 的修改时间（及路径、长度）；不一致则重建 stats.db，不输出排名。
+- `update`：检查 Everything.db 的修改时间（及路径、长度）；不一致则重建 stats.db，不输出排名。`-f` 强制重建。
 - `--db` / `-d`：源数据库，默认 `%LOCALAPPDATA%\Everything\Everything.db`。
 - `--cache`：SQLite 缓存，默认 `%LOCALAPPDATA%\es-stats\stats.db`，不向当前目录写入。
 - `--recursive true`：默认；文件数包含所有后代目录中的文件。

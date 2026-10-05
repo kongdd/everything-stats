@@ -40,17 +40,21 @@ pub struct StatsOptions {
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
     /// Rebuild stats.db if Everything.db path, size, or mtime changed.
-    Update,
+    Update {
+        /// Rebuild even when the source fingerprint matches.
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 pub fn stats(database: &Path, options: &StatsOptions) -> Result<()> {
-    if matches!(options.command, Some(Command::Update)) {
-        return refresh(database, options);
+    if let Some(Command::Update { force }) = options.command {
+        return refresh(database, options, force);
     }
     let root = options.path.as_deref().map(absolute_path).transpose()?;
     let cache_path = options.cache.clone().map_or_else(default_cache, Ok)?;
     let mut connection = cache::open(database, &cache_path)?;
-    cache::ensure(&mut connection, database)?;
+    cache::ensure(&mut connection, database, false)?;
     // Keep the totals and rankings in one SQLite read snapshot during refreshes.
     let transaction = connection.transaction()?;
     let (snapshot, all_files) = cache::metadata(&transaction)?.context("empty statistics cache")?;
@@ -86,10 +90,10 @@ struct Rank {
     path: Vec<u8>,
 }
 
-fn refresh(database: &Path, options: &StatsOptions) -> Result<()> {
+fn refresh(database: &Path, options: &StatsOptions, force: bool) -> Result<()> {
     let cache_path = options.cache.clone().map_or_else(default_cache, Ok)?;
-    let meta = fs::metadata(database)
-        .with_context(|| format!("cannot open {}", database.display()))?;
+    let meta =
+        fs::metadata(database).with_context(|| format!("cannot open {}", database.display()))?;
     eprintln!(
         "{}  {}  {} bytes",
         database.display(),
@@ -97,7 +101,7 @@ fn refresh(database: &Path, options: &StatsOptions) -> Result<()> {
         meta.len()
     );
     let mut connection = cache::open(database, &cache_path)?;
-    let rebuilt = cache::ensure(&mut connection, database)?;
+    let rebuilt = cache::ensure(&mut connection, database, force)?;
     eprintln!(
         "{}  {}",
         cache_path.display(),

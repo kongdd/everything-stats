@@ -156,7 +156,15 @@ fn rejects_corruption_and_unrelated_sqlite_cache() {
 fn update_checks_source_timestamp_without_taking_the_path() {
     use clap::Parser;
     let update = StatsOptions::parse_from(["es-stats", "update", "--db", "x.db"]);
-    assert!(matches!(update.command, Some(Command::Update)));
+    assert!(matches!(
+        update.command,
+        Some(Command::Update { force: false })
+    ));
+    let forced = StatsOptions::parse_from(["es-stats", "update", "-f"]);
+    assert!(matches!(
+        forced.command,
+        Some(Command::Update { force: true })
+    ));
     assert!(update.path.is_none());
     assert_eq!(update.database.unwrap(), PathBuf::from("x.db"));
     let query = StatsOptions::parse_from(["es-stats", r"C:\Users"]);

@@ -85,9 +85,9 @@ pub(super) fn metadata(connection: &Connection) -> Result<Option<(Vec<u8>, i64)>
         .optional()?)
 }
 
-pub(super) fn ensure(connection: &mut Connection, database: &Path) -> Result<bool> {
+pub(super) fn ensure(connection: &mut Connection, database: &Path, force: bool) -> Result<bool> {
     let snapshot = fingerprint(database)?;
-    if metadata(connection)?.is_some_and(|(previous, _)| previous == snapshot) {
+    if !force && metadata(connection)?.is_some_and(|(previous, _)| previous == snapshot) {
         return Ok(false);
     }
     eprintln!("Building file-count cache from {}...", database.display());
