@@ -246,6 +246,22 @@ fn failed_replacement_keeps_previous_cache_intact() {
 }
 
 #[test]
+fn old_database_still_refreshes_and_modern_offline_failure_keeps_cache() {
+    let path = env::temp_dir().join(format!("es-stats-compat-{}.db", std::process::id()));
+    fs::write(&path, fixture(2, 1, 4).0).unwrap();
+    let mut db = rusqlite::Connection::open_in_memory().unwrap();
+    cache::schema(&db).unwrap();
+    assert!(cache::ensure(&mut db, &path, false, false).unwrap());
+    assert!(!cache::ensure(&mut db, &path, false, false).unwrap());
+    let old = cache::metadata(&db).unwrap().unwrap();
+    fs::write(&path, b"ESDb\x32\x00\x07\x01").unwrap();
+    let error = cache::ensure(&mut db, &path, false, false).unwrap_err();
+    assert!(error.to_string().contains("omit --db"));
+    assert_eq!(cache::metadata(&db).unwrap().unwrap(), old);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn replaces_owned_v1_cache_transactionally() {
     let mut db = rusqlite::Connection::open_in_memory().unwrap();
     db.execute_batch(&format!(

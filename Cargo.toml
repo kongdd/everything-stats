@@ -3,7 +3,7 @@ name = "es-stats"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
-description = "Folder file counts from Everything ESDb 1.7.20"
+description = "Folder file counts from Everything 1.4 and 1.5"
 license = "MIT"
 autotests = false
 
@@ -11,6 +11,9 @@ autotests = false
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+
+[build-dependencies]
+cc = "1"
 
 [profile.release]
 lto = "thin"

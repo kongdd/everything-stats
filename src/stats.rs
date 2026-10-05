@@ -54,7 +54,7 @@ pub fn stats(database: &Path, options: &StatsOptions) -> Result<()> {
     let root = options.path.as_deref().map(absolute_path).transpose()?;
     let cache_path = options.cache.clone().map_or_else(default_cache, Ok)?;
     let mut connection = cache::open(database, &cache_path)?;
-    cache::ensure(&mut connection, database, false)?;
+    cache::ensure(&mut connection, database, false, options.database.is_none())?;
     // Keep the totals and rankings in one SQLite read snapshot during refreshes.
     let transaction = connection.transaction()?;
     let (snapshot, all_files) = cache::metadata(&transaction)?.context("empty statistics cache")?;
@@ -94,18 +94,19 @@ fn refresh(database: &Path, options: &StatsOptions, force: bool) -> Result<()> {
     // Explicit --db means an offline snapshot: leave Everything alone.
     #[cfg(windows)]
     if options.database.is_none() {
-        let executable =
-            PathBuf::from(env::var_os("ProgramFiles").context("ProgramFiles is not set")?)
-                .join("Everything/Everything.exe");
+        // ES -save-db waits for saving and supports both Everything 1.4 and 1.5.
+        let executable = ["ProgramFiles", "ProgramFiles(x86)"]
+            .into_iter()
+            .filter_map(env::var_os)
+            .map(|dir| PathBuf::from(dir).join("Everything/es.exe"))
+            .find(|path| path.is_file())
+            .context(
+                "install ES.exe in the Everything directory, or use --db for an offline snapshot",
+            )?;
         let status = std::process::Command::new(&executable)
-            .args(["-no-first-instance", "-save-db-now"])
+            .arg("-save-db")
             .status()
-            .with_context(|| {
-                format!(
-                    "cannot run {} (requires Everything 1.5)",
-                    executable.display()
-                )
-            })?;
+            .with_context(|| format!("cannot run {}", executable.display()))?;
         anyhow::ensure!(status.success(), "Everything failed to save its database");
     }
     let cache_path = options.cache.clone().map_or_else(default_cache, Ok)?;
@@ -118,7 +119,7 @@ fn refresh(database: &Path, options: &StatsOptions, force: bool) -> Result<()> {
         meta.len()
     );
     let mut connection = cache::open(database, &cache_path)?;
-    let rebuilt = cache::ensure(&mut connection, database, force)?;
+    let rebuilt = cache::ensure(&mut connection, database, force, options.database.is_none())?;
     eprintln!(
         "{}  {}",
         cache_path.display(),

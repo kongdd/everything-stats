@@ -68,8 +68,18 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub(crate) fn collect(path: &Path) -> Result<Counts> {
+pub(crate) fn collect(path: &Path, live: bool) -> Result<Counts> {
     let data = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    if data.get(..8) == Some(b"ESDb\x32\x00\x07\x01") {
+        ensure!(
+            live,
+            "ESDb 1.7.50 requires the running Everything 1.5 index; omit --db"
+        );
+        #[cfg(windows)]
+        return crate::sdk::collect();
+        #[cfg(not(windows))]
+        bail!("Everything SDK3 requires Windows");
+    }
     parse(&data)
 }
 

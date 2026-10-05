@@ -85,14 +85,19 @@ pub(super) fn metadata(connection: &Connection) -> Result<Option<(Vec<u8>, i64)>
         .optional()?)
 }
 
-pub(super) fn ensure(connection: &mut Connection, database: &Path, force: bool) -> Result<bool> {
+pub(super) fn ensure(
+    connection: &mut Connection,
+    database: &Path,
+    force: bool,
+    live: bool,
+) -> Result<bool> {
     let snapshot = fingerprint(database)?;
     if !force && metadata(connection)?.is_some_and(|(previous, _)| previous == snapshot) {
         return Ok(false);
     }
     eprintln!("Building file-count cache from {}...", database.display());
     let start = Instant::now();
-    let counts = crate::database::collect(database)?;
+    let counts = crate::database::collect(database, live)?;
     if fingerprint(database)? != snapshot {
         bail!("Everything.db changed while building statistics; retry the command");
     }

@@ -1,4 +1,6 @@
 mod database;
+#[cfg(windows)]
+mod sdk;
 mod stats;
 
 use std::{env, path::PathBuf};
