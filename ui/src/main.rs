@@ -42,8 +42,6 @@ actions!(
         NextPage,
         Delete,
         SelectAll,
-        ExtendUp,
-        ExtendDown,
     ]
 );
 
@@ -101,6 +99,7 @@ impl Everything {
                     let index = *index;
                     this.table.update(cx, |table, cx| {
                         if keep {
+                            table.delegate_mut().cursor = Some(index);
                             return;
                         }
                         let files = table.delegate_mut();
@@ -114,9 +113,10 @@ impl Everything {
                             }
                         } else if shift {
                             files.extend(index);
-                        } else {
+                        } else if !files.is_selected(index) {
                             files.select(index);
                         }
+                        files.cursor = Some(index);
                         if !table.delegate().is_selected(index) {
                             table.clear_selection(cx);
                         }
@@ -138,17 +138,7 @@ impl Everything {
                     this.query.descending = *descending;
                     this.restart(cx);
                 }
-                FilesEvent::ContextRow(row) => {
-                    let row = *row;
-                    this.keep_selection = this.table.read(cx).delegate().is_selected(row);
-                    this.table.update(cx, |table, cx| {
-                        if !table.delegate().is_selected(row) {
-                            table.delegate_mut().select(row);
-                        }
-                        table.set_selected_row(row, cx);
-                    });
-                    this.keep_selection = false;
-                }
+                FilesEvent::ContextRow(_) => cx.notify(),
             }),
         ];
         let (bookmarks, bookmark_error) = match search::load_bookmarks() {
@@ -197,8 +187,11 @@ impl Everything {
             if !*hovered || this.menu.as_ref().is_some_and(|(name, _)| *name == id) {
                 return;
             }
-            let menu = PopupMenu::build(window, cx, |menu, window, cx| build(menu, window, cx));
-            menu.focus_handle(cx).focus(window);
+            let focus = this.focus.clone();
+            let menu = PopupMenu::build(window, cx, |menu, window, cx| {
+                build(menu.action_context(focus), window, cx)
+            });
+            this.click = None;
             this.menu_subscription =
                 Some(cx.subscribe(&menu, |this, menu, _: &DismissEvent, cx| {
                     if this
@@ -327,19 +320,28 @@ impl Everything {
         self.restart(cx);
     }
 
-    fn selected(&self, cx: &App) -> Option<Entry> {
+    fn target(&self, cx: &App) -> Option<Entry> {
         let table = self.table.read(cx);
-        table.delegate().rows.get(table.selected_row()?).cloned()
+        let files = table.delegate();
+        let index = files.clicked.or(files.anchor).or(table.selected_row())?;
+        files.rows.get(index).cloned()
     }
 
     fn open(&mut self, _: &Open, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(entry) = self.selected(cx) {
+        let entries = self.table.read(cx).delegate().selected_entries();
+        if entries.is_empty() {
+            if let Some(entry) = self.target(cx) {
+                cx.open_with_system(&entry.path());
+            }
+            return;
+        }
+        for entry in entries {
             cx.open_with_system(&entry.path());
         }
     }
 
     fn reveal(&mut self, _: &Reveal, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(entry) = self.selected(cx) {
+        if let Some(entry) = self.target(cx) {
             cx.reveal_path(&entry.path());
         }
     }
@@ -435,7 +437,7 @@ impl Everything {
     }
 
     fn search_folder(&mut self, _: &SearchFolder, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(entry) = self.selected(cx) {
+        if let Some(entry) = self.target(cx) {
             let path = if entry.folder {
                 entry.path()
             } else {
@@ -568,7 +570,7 @@ impl Render for Everything {
         let bookmarks = self.bookmarks.clone();
         let view = cx.weak_entity();
         let focus = self.focus.clone();
-        let selected = self.selected(cx);
+        let selected = self.target(cx);
         let rows = self.table.read(cx).delegate().rows.len();
         let status = if self.loading {
             "正在搜索…".into()
@@ -602,15 +604,22 @@ impl Render for Everything {
             .on_action(cx.listener(Self::refresh))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::select_all))
-            .on_action(cx.listener(|this, _: &ExtendUp, _, cx| this.nudge(-1, cx)))
-            .on_action(cx.listener(|this, _: &ExtendDown, _, cx| this.nudge(1, cx)))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, _| {
                 if event.button == MouseButton::Left {
                     this.click = Some(event.modifiers);
                 }
             }))
-            .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _, _| {
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.click = None;
+                let key = event.keystroke.key.as_ref();
+                if event.keystroke.modifiers.shift
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                    && matches!(key, "up" | "down")
+                    && this.table.focus_handle(cx).is_focused(window)
+                {
+                    this.nudge(if key == "up" { -1 } else { 1 }, cx);
+                }
             }))
             .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
             .on_action(cx.listener(|this, _: &PreviousPage, _, cx| this.page(false, cx)))
@@ -884,8 +893,6 @@ fn main() {
                 KeyBinding::new("ctrl-q", Quit, Some("Everything")),
                 KeyBinding::new("delete", Delete, Some("Everything && Table")),
                 KeyBinding::new("ctrl-a", SelectAll, Some("Everything && Table")),
-                KeyBinding::new("shift-up", ExtendUp, Some("Everything && Table")),
-                KeyBinding::new("shift-down", ExtendDown, Some("Everything && Table")),
             ]);
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {

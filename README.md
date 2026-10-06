@@ -34,3 +34,12 @@ cargo build --release
 ```
 
 统计代码改编自 nasfind，保留 MIT 许可。
+
+```toml
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+```

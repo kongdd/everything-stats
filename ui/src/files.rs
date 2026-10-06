@@ -23,6 +23,8 @@ pub struct Files {
     pub icons: icons::Cache,
     pub selected: BTreeSet<usize>,
     pub anchor: Option<usize>,
+    pub clicked: Option<usize>,
+    pub cursor: Option<usize>,
 }
 
 impl Files {
@@ -32,6 +34,8 @@ impl Files {
             icons: icons::Cache::new(),
             selected: BTreeSet::new(),
             anchor: None,
+            clicked: None,
+            cursor: None,
             columns: [
                 ("name", "名称", 280.),
                 ("path", "路径", 420.),
@@ -55,6 +59,8 @@ impl Files {
     pub fn clear_selection(&mut self) {
         self.selected.clear();
         self.anchor = None;
+        self.clicked = None;
+        self.cursor = None;
     }
 
     pub fn is_selected(&self, row: usize) -> bool {
@@ -72,6 +78,7 @@ impl Files {
         self.selected.clear();
         self.selected.insert(row);
         self.anchor = Some(row);
+        self.cursor = Some(row);
     }
 
     pub fn toggle(&mut self, row: usize) {
@@ -81,6 +88,7 @@ impl Files {
             self.selected.insert(row);
             self.anchor = Some(row);
         }
+        self.cursor = Some(row);
     }
 
     pub fn extend(&mut self, row: usize) {
@@ -92,6 +100,7 @@ impl Files {
         };
         self.selected.clear();
         self.selected.extend(start..=end);
+        self.cursor = Some(row);
     }
 
     pub fn select_all(&mut self) {
@@ -126,6 +135,26 @@ impl TableDelegate for Files {
         cx.emit(FilesEvent::Sort(column, sort == ColumnSort::Descending));
     }
 
+    fn render_tr(
+        &mut self,
+        row: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let current = self.cursor == Some(row);
+        div().id(("row", row)).when(current, |row| {
+            row.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .bottom_0()
+                    .w(px(3.))
+                    .bg(cx.theme().selection),
+            )
+        })
+    }
+
     fn render_td(
         &mut self,
         row: usize,
@@ -142,6 +171,7 @@ impl TableDelegate for Files {
             _ => entry.modified.clone(),
         };
         let selected = self.is_selected(row);
+        let current = self.cursor == Some(row);
         h_flex()
             .px_1()
             .gap_1()
@@ -149,7 +179,10 @@ impl TableDelegate for Files {
             .h_full()
             .overflow_hidden()
             .when(column == 3, |row| row.justify_end())
-            .when(selected, |row| row.bg(cx.theme().selection.alpha(0.62)))
+            .when(selected && !current, |row| {
+                row.bg(cx.theme().selection.alpha(0.22))
+            })
+            .when(current, |row| row.bg(cx.theme().selection))
             .when(column == 0, |row| {
                 let icon = self.icons.get(&icons::key(entry)).and_then(Option::as_ref);
                 row.child(match icon {
@@ -185,8 +218,13 @@ impl TableDelegate for Files {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
+        self.clicked = Some(row);
+        if !self.is_selected(row) {
+            self.select(row);
+        }
         cx.emit(FilesEvent::ContextRow(row));
-        menu.menu("打开", Box::new(Open))
+        menu.action_context(cx.focus_handle())
+            .menu("打开", Box::new(Open))
             .menu("打开所在目录", Box::new(Reveal))
             .separator()
             .menu("复制完整路径", Box::new(CopyPath))
@@ -235,6 +273,7 @@ mod tests {
         files.toggle(3);
         assert_eq!(files.selected.iter().copied().collect::<Vec<_>>(), [1, 3]);
         files.extend(4);
+        assert_eq!(files.cursor, Some(4));
         assert_eq!(files.selected.iter().copied().collect::<Vec<_>>(), [3, 4]);
         files.select_all();
         assert_eq!(files.selected.len(), 5);
