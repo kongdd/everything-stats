@@ -1,467 +1,219 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod files;
 mod icons;
 mod search;
 
-use std::{path::PathBuf, rc::Rc, time::Duration};
-
-use gpui::{prelude::*, *};
-use gpui_component::{
-    ActiveTheme, Disableable, IconName, Root, Selectable, Sizable, Theme, ThemeMode,
-    button::{Button, ButtonVariants},
-    h_flex,
-    input::{Input, InputEvent, InputState},
-    menu::{PopupMenu, PopupMenuItem},
-    table::{ColumnSort, Table, TableEvent, TableState},
-    v_flex,
+use std::{
+    cell::Cell,
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process::Command,
+    rc::Rc,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
+    time::{Duration, Instant},
 };
 
-use files::{Files, FilesEvent};
+use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
+use egui_extras::{Column, TableBuilder};
 use search::{Entry, Filter, PAGE_SIZE, Query};
 
-actions!(
-    everything,
-    [
-        Open,
-        Reveal,
-        CopyPath,
-        SearchFolder,
-        Refresh,
-        FocusSearch,
-        Export,
-        Quit,
-        MatchCase,
-        MatchPath,
-        WholeWord,
-        Regex,
-        ToggleTheme,
-        AddBookmark,
-        RemoveBookmark,
-        PreviousPage,
-        NextPage,
-        Delete,
-        SelectAll,
-    ]
-);
+fn main() -> eframe::Result {
+    eframe::run_native(
+        "Everything",
+        eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([1200.0, 760.0])
+                .with_min_inner_size([800.0, 480.0])
+                .with_title("Everything"),
+            ..Default::default()
+        },
+        Box::new(|cc| Ok(Box::new(Everything::new(cc)))),
+    )
+}
+
+#[derive(Clone, Default)]
+struct Selection {
+    rows: BTreeSet<usize>,
+    anchor: Option<usize>,
+    cursor: Option<usize>,
+}
+
+impl Selection {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn select(&mut self, row: usize) {
+        self.rows.clear();
+        self.rows.insert(row);
+        self.anchor = Some(row);
+        self.cursor = Some(row);
+    }
+
+    fn toggle(&mut self, row: usize) {
+        if !self.rows.remove(&row) {
+            self.rows.insert(row);
+        }
+        self.anchor = Some(row);
+        self.cursor = Some(row);
+    }
+
+    fn extend(&mut self, row: usize) {
+        let anchor = *self.anchor.get_or_insert(row);
+        let (start, end) = if anchor <= row {
+            (anchor, row)
+        } else {
+            (row, anchor)
+        };
+        self.rows.clear();
+        self.rows.extend(start..=end);
+        self.cursor = Some(row);
+    }
+
+    fn move_to(&mut self, delta: isize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let current = self.cursor.unwrap_or(0).min(len - 1);
+        self.select((current as isize + delta).clamp(0, len as isize - 1) as usize);
+    }
+
+    fn nudge(&mut self, delta: isize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let current = self.cursor.unwrap_or(0).min(len - 1);
+        if self.anchor.is_none() {
+            self.select(current);
+        }
+        self.extend((current as isize + delta).clamp(0, len as isize - 1) as usize);
+    }
+
+    fn all(&mut self, len: usize) {
+        self.rows.clear();
+        self.rows.extend(0..len);
+        self.cursor.get_or_insert(0);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Click {
+    Row {
+        row: usize,
+        ctrl: bool,
+        shift: bool,
+        double: bool,
+        right: bool,
+    },
+    Open,
+    Reveal,
+    Copy,
+    Delete,
+    Folder,
+    Sort(usize),
+}
+
+enum Job {
+    Deleted(anyhow::Result<bool>, usize),
+    Exported(anyhow::Result<PathBuf>),
+}
 
 struct Everything {
-    focus: FocusHandle,
-    input: Entity<InputState>,
-    table: Entity<TableState<Files>>,
+    text: String,
     query: Query,
+    rows: Vec<Entry>,
     total: usize,
+    selection: Selection,
     loading: bool,
     exporting: bool,
+    deleting: bool,
     revision: u64,
-    pending: Option<Task<()>>,
+    search_rx: Option<(u64, Receiver<anyhow::Result<search::Page>>)>,
+    icon_rx: Option<(u64, Receiver<(String, Option<std::sync::Arc<image::RgbaImage>>)>)>,
+    job_rx: Option<Receiver<Job>>,
+    textures: std::collections::HashMap<String, Option<TextureHandle>>,
+    icon_cache: icons::Cache,
     error: Option<String>,
     note: String,
     bookmarks: Vec<Query>,
     bookmark_error: Option<String>,
-    click: Option<Modifiers>,
-    keep_selection: bool,
-    deleting: bool,
-    menu: Option<(&'static str, Entity<PopupMenu>)>,
-    menu_subscription: Option<Subscription>,
-    _subscriptions: Vec<Subscription>,
+    dirty: Option<Instant>,
+    dark: bool,
+    from_search: bool,
+    menu: Option<&'static str>,
+    follow: bool,
 }
 
 impl Everything {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("搜索文件和文件夹 · 支持 ext:pdf、path:、通配符及 Everything 搜索语法")
-        });
-        let table = cx.new(|cx| TableState::new(Files::new(), window, cx).col_movable(false));
-        let subscriptions = vec![
-            cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
-                InputEvent::Change => this.restart(cx),
-                InputEvent::PressEnter { .. }
-                    if !this.table.read(cx).delegate().rows.is_empty() =>
-                {
-                    this.table
-                        .update(cx, |table, cx| table.set_selected_row(0, cx));
-                    this.table.focus_handle(cx).focus(window);
-                }
-                _ => {}
-            }),
-            cx.subscribe_in(&table, window, |this, _, event, window, cx| match event {
-                TableEvent::DoubleClickedRow(index) => {
-                    if let Some(entry) = this.table.read(cx).delegate().rows.get(*index) {
-                        cx.open_with_system(&entry.path());
-                    }
-                }
-                TableEvent::SelectRow(index) => {
-                    let click = this.click.take();
-                    let keep = this.keep_selection;
-                    let shift = window.modifiers().shift;
-                    let index = *index;
-                    this.table.update(cx, |table, cx| {
-                        if keep {
-                            table.delegate_mut().cursor = Some(index);
-                            return;
-                        }
-                        let files = table.delegate_mut();
-                        if let Some(modifiers) = click {
-                            if modifiers.control {
-                                files.toggle(index);
-                            } else if modifiers.shift {
-                                files.extend(index);
-                            } else {
-                                files.select(index);
-                            }
-                        } else if shift {
-                            files.extend(index);
-                        } else if !files.is_selected(index) {
-                            files.select(index);
-                        }
-                        files.cursor = Some(index);
-                        if !table.delegate().is_selected(index) {
-                            table.clear_selection(cx);
-                        }
-                        cx.notify();
-                    });
-                }
-                TableEvent::ColumnWidthsChanged(widths) => {
-                    this.table.update(cx, |table, _| {
-                        for (column, width) in table.delegate_mut().columns.iter_mut().zip(widths) {
-                            column.width = *width;
-                        }
-                    });
-                }
-                _ => {}
-            }),
-            cx.subscribe(&table, |this, _, event, cx| match event {
-                FilesEvent::Sort(column, descending) => {
-                    this.query.sort_column = *column;
-                    this.query.descending = *descending;
-                    this.restart(cx);
-                }
-                FilesEvent::ContextRow(_) => cx.notify(),
-            }),
-        ];
+    fn new(cc: &eframe::CreationContext) -> Self {
+        style(&cc.egui_ctx, false);
+        cc.egui_ctx
+            .memory_mut(|memory| memory.request_focus(egui::Id::new("search")));
         let (bookmarks, bookmark_error) = match search::load_bookmarks() {
             Ok(bookmarks) => (bookmarks, None),
             Err(error) => (Vec::new(), Some(format!("{error:#}"))),
         };
-        input.update(cx, |input, cx| input.focus(window, cx));
-        let mut view = Self {
-            focus: cx.focus_handle(),
-            input,
-            table,
+        let mut app = Self {
+            text: String::new(),
             query: Query::default(),
+            rows: Vec::new(),
             total: 0,
+            selection: Selection::default(),
             loading: false,
             exporting: false,
+            deleting: false,
             revision: 0,
-            pending: None,
+            search_rx: None,
+            icon_rx: None,
+            job_rx: None,
+            textures: std::collections::HashMap::new(),
+            icon_cache: icons::Cache::new(),
             error: bookmark_error.clone(),
             note: String::new(),
             bookmarks,
             bookmark_error,
-            click: None,
-            keep_selection: false,
-            deleting: false,
+            dirty: None,
+            dark: false,
+            from_search: false,
             menu: None,
-            menu_subscription: None,
-            _subscriptions: subscriptions,
+            follow: false,
         };
-        view.run_search(cx);
-        view
+        app.start_search(&cc.egui_ctx);
+        app
     }
 
-    fn menu(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        build: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let menu = self
-            .menu
-            .as_ref()
-            .filter(|(name, _)| *name == id)
-            .map(|(_, menu)| menu.clone());
-        let show = Rc::new(cx.listener(move |this, hovered: &bool, window, cx| {
-            if !*hovered || this.menu.as_ref().is_some_and(|(name, _)| *name == id) {
-                return;
-            }
-            let focus = this.focus.clone();
-            let menu = PopupMenu::build(window, cx, |menu, window, cx| {
-                build(menu.action_context(focus), window, cx)
-            });
-            this.click = None;
-            this.menu_subscription =
-                Some(cx.subscribe(&menu, |this, menu, _: &DismissEvent, cx| {
-                    if this
-                        .menu
-                        .as_ref()
-                        .is_some_and(|(_, active)| *active == menu)
-                    {
-                        this.menu = None;
-                        this.menu_subscription = None;
-                        #[cfg(debug_assertions)]
-                        eprintln!("menu:closed");
-                        cx.notify();
-                    }
-                }));
-            this.menu = Some((id, menu));
-            #[cfg(debug_assertions)]
-            eprintln!("menu:{id}");
-            cx.notify();
-        }));
-        let click = show.clone();
-        div()
-            .id(id)
-            .relative()
-            .on_hover(move |hovered, window, cx| show(hovered, window, cx))
-            .child(
-                Button::new("menu")
-                    .small()
-                    .ghost()
-                    .label(label)
-                    .selected(menu.is_some())
-                    .on_click(move |_, window, cx| click(&true, window, cx)),
-            )
-            .when_some(menu, |this, menu| {
-                this.child(deferred(
-                    anchored()
-                        .anchor(Corner::TopLeft)
-                        .snap_to_window_with_margin(px(8.))
-                        .child(div().occlude().top_1().child(menu)),
-                ))
-            })
-            .into_any_element()
-    }
-
-    fn restart(&mut self, cx: &mut Context<Self>) {
-        self.query.offset = 0;
-        self.query.text = self.input.read(cx).value().to_string();
-        self.run_search(cx);
-    }
-
-    fn run_search(&mut self, cx: &mut Context<Self>) {
+    fn start_search(&mut self, ctx: &egui::Context) {
         self.revision += 1;
         let revision = self.revision;
         let query = self.query.clone();
         self.loading = true;
         self.error = None;
         self.note.clear();
-        self.table.update(cx, |table, cx| {
-            table.delegate_mut().rows.clear();
-            table.delegate_mut().clear_selection();
-            table.clear_selection(cx);
-        });
-        let icons = self.table.read(cx).delegate().icons.clone();
-        let timer = cx.background_executor().timer(Duration::from_millis(120));
-        self.pending = Some(cx.spawn(async move |this, cx| {
-            timer.await;
-            let result = cx
-                .background_executor()
-                .spawn(async move { search::search(&query) })
-                .await;
-            let Ok(Some(rows)) = this.update(cx, |this, cx| {
-                if revision != this.revision {
-                    return None;
-                }
-                this.loading = false;
-                let rows = match result {
-                    Ok(page) => {
-                        this.total = page.total;
-                        if this.total == 0 {
-                            this.query.offset = 0;
-                        } else if this.query.offset >= this.total {
-                            this.query.offset = (this.total - 1) / PAGE_SIZE * PAGE_SIZE;
-                            this.run_search(cx);
-                            return None;
-                        }
-                        let rows = page.rows.clone();
-                        this.table.update(cx, |table, cx| {
-                            table.delegate_mut().rows = page.rows;
-                            table.scroll_to_row(0, cx);
-                            cx.notify();
-                        });
-                        Some(rows)
-                    }
-                    Err(error) => {
-                        this.total = 0;
-                        this.error = Some(format!("{error:#}"));
-                        None
-                    }
-                };
-                cx.notify();
-                rows
-            }) else {
-                return;
-            };
-            if rows.is_empty() {
-                return;
-            }
-            let icons = cx
-                .background_executor()
-                .spawn(async move { icons::load(&rows, icons) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if revision == this.revision {
-                    this.table.update(cx, |table, cx| {
-                        table.delegate_mut().icons = icons;
-                        cx.notify();
-                    });
-                }
-            });
-        }));
-        cx.notify();
-    }
-
-    fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
-        self.table
-            .update(cx, |table, _| table.delegate_mut().icons.clear());
-        self.restart(cx);
-    }
-
-    fn target(&self, cx: &App) -> Option<Entry> {
-        let table = self.table.read(cx);
-        let files = table.delegate();
-        let index = files.clicked.or(files.anchor).or(table.selected_row())?;
-        files.rows.get(index).cloned()
-    }
-
-    fn open(&mut self, _: &Open, _: &mut Window, cx: &mut Context<Self>) {
-        let entries = self.table.read(cx).delegate().selected_entries();
-        if entries.is_empty() {
-            if let Some(entry) = self.target(cx) {
-                cx.open_with_system(&entry.path());
-            }
-            return;
-        }
-        for entry in entries {
-            cx.open_with_system(&entry.path());
-        }
-    }
-
-    fn reveal(&mut self, _: &Reveal, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(entry) = self.target(cx) {
-            cx.reveal_path(&entry.path());
-        }
-    }
-
-    fn copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
-        let paths: Vec<_> = self
-            .table
-            .read(cx)
-            .delegate()
-            .selected_entries()
-            .iter()
-            .map(|entry| entry.path().display().to_string())
-            .collect();
-        if paths.is_empty() {
-            return;
-        }
-        cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
-        self.note = if paths.len() == 1 {
-            "已复制完整路径".into()
-        } else {
-            format!("已复制 {} 条路径", paths.len())
-        };
-        cx.notify();
-    }
-
-    fn nudge(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let current = self.table.read(cx).selected_row().unwrap_or(0);
-        let count = self.table.read(cx).delegate().rows.len();
-        if count == 0 {
-            return;
-        }
-        let next = (current as isize + delta).clamp(0, count as isize - 1) as usize;
-        self.keep_selection = true;
-        self.table.update(cx, |table, cx| {
-            if table.delegate().anchor.is_none() {
-                table.delegate_mut().select(current);
-            }
-            table.delegate_mut().extend(next);
-            table.set_selected_row(next, cx);
-        });
-        self.keep_selection = false;
-    }
-
-    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.table.update(cx, |table, cx| {
-            table.delegate_mut().select_all();
-            cx.notify();
+        self.selection.clear();
+        let (tx, rx) = mpsc::channel();
+        self.search_rx = Some((revision, rx));
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(search::search(&query));
+            ctx.request_repaint();
         });
     }
 
-    fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
-        if self.deleting {
-            return;
-        }
-        let entries = self.table.read(cx).delegate().selected_entries();
-        if entries.is_empty() {
-            return;
-        }
-        self.deleting = true;
-        self.note = "正在删除…".into();
-        cx.notify();
-        let count = entries.len();
-        let task = std::thread::spawn(move || search::recycle(&entries));
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { task.join() })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.deleting = false;
-                match result {
-                    Ok(Ok(true)) => {
-                        this.run_search(cx);
-                        this.note = format!("已移到回收站：{count} 项");
-                        cx.notify();
-                    }
-                    Ok(Ok(false)) => {
-                        this.note.clear();
-                        cx.notify();
-                    }
-                    Ok(Err(error)) => {
-                        this.error = Some(format!("{error:#}"));
-                        cx.notify();
-                    }
-                    Err(_) => {
-                        this.error = Some("删除线程异常退出".into());
-                        cx.notify();
-                    }
-                }
-            });
-        })
-        .detach();
+    fn restart(&mut self, ctx: &egui::Context) {
+        self.query.offset = 0;
+        self.query.text = self.text.clone();
+        self.dirty = None;
+        self.start_search(ctx);
     }
 
-    fn search_folder(&mut self, _: &SearchFolder, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(entry) = self.target(cx) {
-            let path = if entry.folder {
-                entry.path()
-            } else {
-                PathBuf::from(entry.directory)
-            };
-            let text = format!(
-                "\"{}\\\"",
-                path.display().to_string().trim_end_matches('\\')
-            );
-            self.query.filter = Filter::All;
-            self.query.regex = false;
-            self.input.update(cx, |input, cx| {
-                input.set_value(text, window, cx);
-                input.focus(window, cx);
-            });
-            self.restart(cx);
-        }
+    fn refresh(&mut self, ctx: &egui::Context) {
+        self.textures.clear();
+        self.icon_cache.clear();
+        self.restart(ctx);
     }
 
-    fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.update(cx, |input, cx| input.focus(window, cx));
-    }
-
-    fn page(&mut self, forward: bool, cx: &mut Context<Self>) {
+    fn page(&mut self, forward: bool, ctx: &egui::Context) {
         if self.loading {
             return;
         }
@@ -472,53 +224,178 @@ impl Everything {
         };
         if offset != self.query.offset && offset < self.total {
             self.query.offset = offset;
-            self.run_search(cx);
+            self.query.text = self.text.clone();
+            self.start_search(ctx);
         }
     }
 
-    fn export(&mut self, _: &Export, _: &mut Window, cx: &mut Context<Self>) {
+    fn start_icons(&mut self, ctx: &egui::Context) {
+        let revision = self.revision;
+        let mut seen = BTreeSet::new();
+        let missing: Vec<Entry> = self
+            .rows
+            .iter()
+            .filter(|entry| {
+                let key = icons::key(entry);
+                seen.insert(key.clone()) && !self.icon_cache.contains_key(&key)
+            })
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.icon_rx = Some((revision, rx));
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let (work_tx, work_rx) = mpsc::channel();
+            for entry in missing {
+                let _ = work_tx.send(entry);
+            }
+            drop(work_tx);
+            let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let work_rx = work_rx.clone();
+                let tx = tx.clone();
+                let ctx = ctx.clone();
+                workers.push(thread::spawn(move || {
+                    while let Ok(entry) = work_rx.lock().unwrap().recv() {
+                        let key = icons::key(&entry);
+                        let _ = tx.send((key, icons::fetch(&entry)));
+                        ctx.request_repaint();
+                    }
+                }));
+            }
+            drop(tx);
+            for worker in workers {
+                let _ = worker.join();
+            }
+        });
+    }
+
+    fn selected_entries(&self) -> Vec<Entry> {
+        self.selection
+            .rows
+            .iter()
+            .filter_map(|index| self.rows.get(*index).cloned())
+            .collect()
+    }
+
+    fn target(&self) -> Option<&Entry> {
+        self.selection.cursor.and_then(|index| self.rows.get(index))
+    }
+
+    fn open_entries(&mut self, entries: &[Entry]) {
+        // ponytail: cap at 20; raise if batch-open is required.
+        for entry in entries.iter().take(20) {
+            open_path(&entry.path());
+        }
+        if entries.len() > 20 {
+            self.note = format!("已打开前 20 项，共 {} 项", entries.len());
+        }
+    }
+
+    fn open_selected(&mut self) {
+        let entries = self.selected_entries();
+        if entries.is_empty() {
+            if let Some(entry) = self.target().cloned() {
+                open_path(&entry.path());
+            }
+            return;
+        }
+        self.open_entries(&entries);
+    }
+
+    fn reveal(&mut self) {
+        if let Some(entry) = self.target() {
+            reveal_path(&entry.path());
+        }
+    }
+
+    fn copy_paths(&mut self, ctx: &egui::Context) {
+        let paths: Vec<_> = self
+            .selected_entries()
+            .iter()
+            .map(|entry| entry.path().display().to_string())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        ctx.copy_text(paths.join("\n"));
+        self.note = if paths.len() == 1 {
+            "已复制完整路径".into()
+        } else {
+            format!("已复制 {} 条路径", paths.len())
+        };
+    }
+
+    fn search_folder(&mut self, ctx: &egui::Context) {
+        let Some(entry) = self.target().cloned() else {
+            return;
+        };
+        let path = if entry.folder {
+            entry.path()
+        } else {
+            PathBuf::from(entry.directory)
+        };
+        self.text = format!(
+            "\"{}\\\"",
+            path.display().to_string().trim_end_matches(['\\', '/'])
+        );
+        self.query.filter = Filter::All;
+        self.query.regex = false;
+        self.restart(ctx);
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("search")));
+    }
+
+    fn delete_selected(&mut self, ctx: &egui::Context) {
+        if self.deleting {
+            return;
+        }
+        let entries = self.selected_entries();
+        if entries.is_empty() {
+            return;
+        }
+        self.deleting = true;
+        self.note = "正在删除…".into();
+        let count = entries.len();
+        let (tx, rx) = mpsc::channel();
+        self.job_rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(Job::Deleted(search::recycle(&entries), count));
+            ctx.request_repaint();
+        });
+    }
+
+    fn export(&mut self, ctx: &egui::Context) {
         if self.exporting {
             return;
         }
-        let directory = std::env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let prompt = cx.prompt_for_new_path(&directory, Some("everything-results.csv"));
-        let query = self.query.clone();
+        let Some(path) = save_csv() else {
+            return;
+        };
         self.exporting = true;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result: anyhow::Result<Option<PathBuf>> = async {
-                let Some(path) = prompt.await?? else {
-                    return Ok(None);
-                };
-                let destination = path.clone();
-                cx.background_executor()
-                    .spawn(async move { search::export(&query, &destination) })
-                    .await?;
-                Ok(Some(path))
-            }
-            .await;
-            let _ = this.update(cx, |this, cx| {
-                this.exporting = false;
-                match result {
-                    Ok(Some(path)) => this.note = format!("已导出：{}", path.display()),
-                    Ok(None) => {}
-                    Err(error) => this.error = Some(format!("{error:#}")),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.note = "正在导出全部结果…".into();
+        let query = self.query.clone();
+        let (tx, rx) = mpsc::channel();
+        self.job_rx = Some(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = search::export(&query, &path).map(|()| path);
+            let _ = tx.send(Job::Exported(result));
+            ctx.request_repaint();
+        });
     }
 
-    fn bookmark(&mut self, remove: bool, cx: &mut Context<Self>) {
+    fn bookmark(&mut self, remove: bool) {
         if let Some(error) = &self.bookmark_error {
             self.error = Some(format!("书签未写入：{error}；请修复 bookmarks.json 后重启"));
-            cx.notify();
             return;
         }
         let mut query = self.query.clone();
+        query.text = self.text.clone();
         query.offset = 0;
         let mut bookmarks = self.bookmarks.clone();
         if remove {
@@ -538,385 +415,1078 @@ impl Everything {
             }
             Err(error) => self.error = Some(format!("{error:#}")),
         }
-        cx.notify();
     }
 
-    fn use_bookmark(&mut self, query: Query, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.update(cx, |input, cx| {
-            input.set_value(query.text.clone(), window, cx)
-        });
+    fn apply_bookmark(&mut self, query: Query, ctx: &egui::Context) {
+        self.text = query.text.clone();
         self.query = query;
-        let column = self.query.sort_column.min(4);
-        let descending = self.query.descending;
-        self.table.update(cx, |table, cx| {
-            for (index, definition) in table.delegate_mut().columns.iter_mut().enumerate() {
-                definition.sort = Some(if index != column {
-                    ColumnSort::Default
-                } else if descending {
-                    ColumnSort::Descending
-                } else {
-                    ColumnSort::Ascending
-                });
-            }
-            table.refresh(cx);
-        });
-        self.restart(cx);
+        self.restart(ctx);
     }
-}
 
-impl Render for Everything {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let options = self.query.clone();
-        let bookmarks = self.bookmarks.clone();
-        let view = cx.weak_entity();
-        let focus = self.focus.clone();
-        let selected = self.target(cx);
-        let rows = self.table.read(cx).delegate().rows.len();
-        let status = if self.loading {
+    fn poll(&mut self, ctx: &egui::Context) {
+        let search = self
+            .search_rx
+            .as_ref()
+            .and_then(|(revision, rx)| match rx.try_recv() {
+                Ok(result) => Some((*revision, Some(result))),
+                Err(TryRecvError::Disconnected) => Some((*revision, None)),
+                Err(TryRecvError::Empty) => None,
+            });
+        if let Some((revision, result)) = search {
+            self.search_rx = None;
+            if revision == self.revision {
+                self.loading = false;
+                match result {
+                    Some(Ok(page))
+                        if self.query.offset > 0
+                            && page.rows.is_empty()
+                            && self.query.offset >= page.total =>
+                    {
+                        self.total = page.total;
+                        self.query.offset = page.total.saturating_sub(1) / PAGE_SIZE * PAGE_SIZE;
+                        self.start_search(ctx);
+                    }
+                    Some(Ok(page)) => {
+                        self.rows = page.rows;
+                        self.total = page.total;
+                        self.selection.clear();
+                        self.start_icons(ctx);
+                    }
+                    Some(Err(error)) => {
+                        self.rows.clear();
+                        self.total = 0;
+                        self.selection.clear();
+                        self.error = Some(format!("{error:#}"));
+                    }
+                    None => self.error = Some("搜索线程异常退出".into()),
+                }
+            }
+        }
+
+        if let Some((revision, rx)) = self.icon_rx.take() {
+            if revision == self.revision {
+                loop {
+                    match rx.try_recv() {
+                        Ok((key, image)) => {
+                            if !self.textures.contains_key(&key) {
+                                let handle = image.as_ref().map(|image| {
+                                    let color = ColorImage::from_rgba_unmultiplied(
+                                        [image.width() as usize, image.height() as usize],
+                                        image.as_raw(),
+                                    );
+                                    ctx.load_texture(
+                                        key.clone(),
+                                        color,
+                                        TextureOptions::LINEAR,
+                                    )
+                                });
+                                self.textures.insert(key.clone(), handle);
+                            }
+                            self.icon_cache.insert(key, image);
+                        }
+                        Err(TryRecvError::Empty) => {
+                            self.icon_rx = Some((revision, rx));
+                            break;
+                        }
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
+        }
+
+        let job = self.job_rx.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(job) => Some(Some(job)),
+            Err(TryRecvError::Disconnected) => Some(None),
+            Err(TryRecvError::Empty) => None,
+        });
+        if let Some(job) = job {
+            self.job_rx = None;
+            self.deleting = false;
+            self.exporting = false;
+            match job {
+                Some(Job::Deleted(Ok(true), count)) => {
+                    self.note = format!("已移到回收站：{count} 项");
+                    self.start_search(ctx);
+                }
+                Some(Job::Deleted(Ok(false), _)) => self.note.clear(),
+                Some(Job::Deleted(Err(error), _)) => self.error = Some(format!("{error:#}")),
+                Some(Job::Exported(Ok(path))) => {
+                    self.note = format!("已导出：{}", path.display());
+                }
+                Some(Job::Exported(Err(error))) => self.error = Some(format!("{error:#}")),
+                None => self.error = Some("后台任务异常退出".into()),
+            }
+        }
+
+        if self
+            .dirty
+            .is_some_and(|time| time.elapsed() >= Duration::from_millis(120))
+        {
+            self.restart(ctx);
+        }
+        if self.dirty.is_some()
+            || self.search_rx.is_some()
+            || self.icon_rx.is_some()
+            || self.job_rx.is_some()
+        {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    fn keys(&mut self, ctx: &egui::Context) {
+        let search = egui::Id::new("search");
+        if ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::COMMAND, egui::Key::F)
+                || input.consume_key(egui::Modifiers::COMMAND, egui::Key::L)
+        }) {
+            ctx.memory_mut(|memory| memory.request_focus(search));
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
+            self.refresh(ctx);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::E)) {
+            self.export(ctx);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::D)) {
+            self.bookmark(false);
+        }
+        if ctx.memory(|memory| memory.has_focus(search)) {
+            return;
+        }
+        if self.from_search {
+            self.from_search = false;
+            ctx.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            });
+        } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        {
+            self.open_selected();
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::Enter)) {
+            self.reveal();
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::C)) {
+            self.copy_paths(ctx);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+            self.selection.all(self.rows.len());
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)) {
+            self.delete_selected(ctx);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp)) {
+            self.page(false, ctx);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown)) {
+            self.page(true, ctx);
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.menu = None;
+        }
+        let moved = if ctx
+            .input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp))
+        {
+            self.selection.nudge(-1, self.rows.len());
+            true
+        } else if ctx
+            .input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown))
+        {
+            self.selection.nudge(1, self.rows.len());
+            true
+        } else if ctx
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
+        {
+            self.selection.move_to(-1, self.rows.len());
+            true
+        } else if ctx
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
+        {
+            self.selection.move_to(1, self.rows.len());
+            true
+        } else {
+            false
+        };
+        self.follow |= moved;
+    }
+
+    fn menus(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let open = Rc::new(Cell::new(self.menu));
+        let mut over = false;
+        egui::MenuBar::new()
+            .style(|style: &mut egui::Style| {
+                style.spacing.button_padding = egui::vec2(6.0, 1.0);
+                style.spacing.item_spacing.x = 2.0;
+                style.spacing.interact_size.y = 18.0;
+                style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                style.visuals.widgets.hovered.expansion = 0.0;
+            })
+            .ui(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.spacing_mut().button_padding = egui::vec2(4.0, 0.0);
+                over |= hover_menu(ui, "file", "文件", &open, |ui| {
+                    if ui.button("打开").clicked() {
+                        self.open_selected();
+                        open.set(None);
+                        ui.close();
+                    }
+                    if ui.button("打开所在目录").clicked() {
+                        self.reveal();
+                        open.set(None);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("导出全部结果 CSV…").clicked() {
+                        self.export(&ctx);
+                        open.set(None);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("退出").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                over |= hover_menu(ui, "edit", "编辑", &open, |ui| {
+                    if ui.button("复制完整路径").clicked() {
+                        self.copy_paths(&ctx);
+                        open.set(None);
+                        ui.close();
+                    }
+                    if ui.button("搜索此目录").clicked() {
+                        self.search_folder(&ctx);
+                        open.set(None);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("定位搜索框").clicked() {
+                        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("search")));
+                        open.set(None);
+                        ui.close();
+                    }
+                });
+                over |= hover_menu(ui, "search", "搜索", &open, |ui| {
+                    let mut changed = false;
+                    changed |= menu_check(ui, "区分大小写", "Ctrl+I", &mut self.query.match_case);
+                    changed |= menu_check(ui, "匹配完整路径", "", &mut self.query.match_path);
+                    changed |= menu_check(ui, "全字匹配", "", &mut self.query.whole_word);
+                    changed |= menu_check(ui, "正则表达式", "", &mut self.query.regex);
+                    ui.separator();
+                    for item in Filter::ALL {
+                        if menu_mark(ui, item.label(), self.query.filter == item) {
+                            self.query.filter = item;
+                            changed = true;
+                            open.set(None);
+                            ui.close();
+                        }
+                    }
+                    if changed {
+                        self.restart(&ctx);
+                    }
+                });
+                over |= hover_menu(ui, "view", "查看", &open, |ui| {
+                    if ui.button("刷新").clicked() {
+                        self.refresh(&ctx);
+                        open.set(None);
+                        ui.close();
+                    }
+                    if ui.button("切换深色／浅色").clicked() {
+                        self.dark = !self.dark;
+                        style(&ctx, self.dark);
+                        open.set(None);
+                        ui.close();
+                    }
+                });
+                over |= hover_menu(ui, "bookmarks", "书签", &open, |ui| {
+                    if ui.button("收藏当前搜索").clicked() {
+                        self.bookmark(false);
+                        open.set(None);
+                        ui.close();
+                    }
+                    if ui.button("移除当前书签").clicked() {
+                        self.bookmark(true);
+                        open.set(None);
+                        ui.close();
+                    }
+                    ui.separator();
+                    for query in self.bookmarks.clone() {
+                        let label = format!(
+                            "{} · {}",
+                            query.filter.label(),
+                            if query.text.is_empty() {
+                                "全部对象"
+                            } else {
+                                &query.text
+                            }
+                        );
+                        if ui.button(label).clicked() {
+                            self.apply_bookmark(query, &ctx);
+                            open.set(None);
+                            ui.close();
+                        }
+                    }
+                });
+                over |= hover_menu(ui, "help", "帮助", &open, |ui| {
+                    ui.hyperlink_to(
+                        "Everything 搜索语法",
+                        "https://www.voidtools.com/support/everything/searching/",
+                    );
+                });
+            });
+        if !over {
+            open.set(None);
+        }
+        self.menu = open.get();
+    }
+
+    fn search_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(180));
+            ui.visuals_mut().selection.stroke = stroke;
+            ui.visuals_mut().widgets.inactive.bg_stroke = stroke;
+            ui.visuals_mut().widgets.hovered.bg_stroke = stroke;
+            ui.visuals_mut().widgets.active.bg_stroke = stroke;
+            let width = ui.available_width();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.text)
+                    .id(egui::Id::new("search"))
+                    .desired_width(width)
+                    .margin(egui::Margin {
+                        left: 6,
+                        right: 24,
+                        top: 5,
+                        bottom: 5,
+                    }),
+            );
+            let center = response.rect.right_center() - egui::vec2(12.0, 0.0);
+            let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(96));
+            ui.painter()
+                .circle_stroke(center + egui::vec2(-2.0, -1.0), 4.5, stroke);
+            ui.painter().line_segment(
+                [
+                    center + egui::vec2(1.5, 2.2),
+                    center + egui::vec2(4.8, 5.5),
+                ],
+                stroke,
+            );
+            if response.changed() {
+                self.dirty = Some(Instant::now());
+            }
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                self.from_search = true;
+                if !self.rows.is_empty() {
+                    self.selection.select(0);
+                }
+            }
+        });
+    }
+
+    fn table(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        // Idle column rules are full-height; Everything only hints them in the header.
+        ui.visuals_mut().widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+        let event = Rc::new(Cell::new(None::<Click>));
+        let n = self.rows.len();
+        let selection = self.selection.clone();
+        let mut table = TableBuilder::new(ui)
+            .id_salt("header-28")
+            .striped(false)
+            .resizable(true)
+            .vscroll(true)
+            .sense(egui::Sense::click())
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(280.0).at_least(80.0).clip(true))
+            .column(Column::remainder().at_least(120.0).clip(true))
+            .column(Column::initial(72.0).at_least(48.0).clip(true))
+            .column(Column::initial(84.0).at_least(56.0).clip(true))
+            .column(Column::initial(148.0).at_least(120.0).clip(true));
+        if self.follow
+            && let Some(row) = self.selection.cursor
+        {
+            table = table.scroll_to_row(row, None);
+            self.follow = false;
+        }
+        table
+            .header(24.0, |mut header| {
+                for (index, title) in ["名称", "路径", "类型", "大小", "修改时间"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let sorted = self.query.sort_column == index;
+                    let click = event.clone();
+                    header.col(|ui| {
+                        let rect = ui.max_rect();
+                        let resp = ui.interact(rect, ui.id().with("sort"), egui::Sense::click());
+                        let bg = if sorted && !ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(204, 232, 255)
+                        } else if resp.hovered() {
+                            ui.visuals().widgets.hovered.weak_bg_fill
+                        } else {
+                            ui.visuals().faint_bg_color
+                        };
+                        ui.painter().rect_filled(rect, 0.0, bg);
+                        let (align, pos) = if index == 3 {
+                            (
+                                egui::Align2::RIGHT_CENTER,
+                                rect.right_center() - egui::vec2(6.0, 0.0),
+                            )
+                        } else {
+                            (
+                                egui::Align2::LEFT_CENTER,
+                                rect.left_center() + egui::vec2(6.0, 0.0),
+                            )
+                        };
+                        ui.painter().text(
+                            pos,
+                            align,
+                            title,
+                            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                            ui.visuals().text_color(),
+                        );
+                        if sorted {
+                            let c = rect.center();
+                            let dy = if self.query.descending { 1.5 } else { -1.5 };
+                            let tip = c + egui::vec2(0.0, dy);
+                            let stroke = egui::Stroke::new(1.0_f32, ui.visuals().text_color());
+                            ui.painter()
+                                .line_segment([c + egui::vec2(-5.0, -dy), tip], stroke);
+                            ui.painter()
+                                .line_segment([tip, c + egui::vec2(5.0, -dy)], stroke);
+                        }
+                        let line = egui::Stroke::new(
+                            1.0_f32,
+                            if ui.visuals().dark_mode {
+                                egui::Color32::from_gray(60)
+                            } else {
+                                egui::Color32::from_rgb(226, 226, 226)
+                            },
+                        );
+                        ui.painter().hline(rect.x_range(), rect.bottom(), line);
+                        if index + 1 < 5 {
+                            ui.painter().vline(rect.right(), rect.y_range(), line);
+                        }
+                        if resp.clicked() {
+                            click.set(Some(Click::Sort(index)));
+                        }
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(20.0, n, |mut row| {
+                    let index = row.index();
+                    let selected = selection.rows.contains(&index);
+                    for column in 0..5 {
+                        let click = event.clone();
+                        row.col(|ui| {
+                            self.draw_cell(ui, index, column, selected, &click);
+                        });
+                    }
+                });
+            });
+        self.apply_click(event.get(), ui.ctx());
+    }
+
+    fn draw_cell(
+        &self,
+        ui: &mut egui::Ui,
+        index: usize,
+        column: usize,
+        selected: bool,
+        click: &Rc<Cell<Option<Click>>>,
+    ) {
+        let rect = ui.max_rect();
+        if selected {
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_rgb(168, 206, 242));
+        }
+        let entry = &self.rows[index];
+        let text = match column {
+            0 => entry.name.clone(),
+            1 => entry.directory.clone(),
+            2 => entry.kind(),
+            3 => size_text(entry.size),
+            _ => date_text(&entry.modified),
+        };
+        let color = ui.visuals().text_color();
+        let text = egui::RichText::new(text).color(color);
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if column == 3 {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(text)
+                        .truncate()
+                        .sense(egui::Sense::hover()),
+                );
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.add_space(if column == 0 { 2.0 } else { 4.0 });
+                if column == 0 {
+                    if let Some(Some(texture)) = self.textures.get(&icons::key(entry)) {
+                        ui.image((texture.id(), egui::vec2(16.0, 16.0)));
+                    } else {
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                    }
+                }
+                ui.add(
+                    egui::Label::new(text)
+                        .truncate()
+                        .sense(egui::Sense::hover()),
+                );
+            });
+        }
+        // Text is painted first. The hit target must be last or it never sees the click.
+        let response = ui.interact(rect, ui.id().with("hit"), egui::Sense::click());
+        if response.clicked() || response.secondary_clicked() {
+            ui.memory_mut(|memory| memory.surrender_focus(egui::Id::new("search")));
+        }
+        if response.double_clicked() {
+            click.set(Some(Click::Row {
+                row: index,
+                ctrl: false,
+                shift: false,
+                double: true,
+                right: false,
+            }));
+        } else if response.secondary_clicked() {
+            click.set(Some(Click::Row {
+                row: index,
+                ctrl: false,
+                shift: false,
+                double: false,
+                right: true,
+            }));
+        } else if response.clicked() {
+            let mods = ui.input(|input| input.modifiers);
+            click.set(Some(Click::Row {
+                row: index,
+                ctrl: mods.command,
+                shift: mods.shift,
+                double: false,
+                right: false,
+            }));
+        }
+        response.context_menu(|ui| {
+            if ui.button("打开").clicked() {
+                click.set(Some(Click::Open));
+                ui.close();
+            }
+            if ui.button("打开所在目录").clicked() {
+                click.set(Some(Click::Reveal));
+                ui.close();
+            }
+            if ui.button("复制完整路径").clicked() {
+                click.set(Some(Click::Copy));
+                ui.close();
+            }
+            if ui.button("搜索此目录").clicked() {
+                click.set(Some(Click::Folder));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("删除到回收站").clicked() {
+                click.set(Some(Click::Delete));
+                ui.close();
+            }
+        });
+    }
+
+    fn apply_click(&mut self, click: Option<Click>, ctx: &egui::Context) {
+        match click {
+            Some(Click::Row {
+                row,
+                ctrl,
+                shift,
+                double,
+                right,
+            }) => {
+                if right {
+                    if !self.selection.rows.contains(&row) {
+                        self.selection.select(row);
+                    } else {
+                        self.selection.cursor = Some(row);
+                    }
+                } else if ctrl {
+                    self.selection.toggle(row);
+                } else if shift {
+                    self.selection.extend(row);
+                } else {
+                    self.selection.select(row);
+                }
+                if double && let Some(entry) = self.rows.get(row).cloned() {
+                    open_path(&entry.path());
+                }
+            }
+            Some(Click::Open) => self.open_selected(),
+            Some(Click::Reveal) => self.reveal(),
+            Some(Click::Copy) => self.copy_paths(ctx),
+            Some(Click::Delete) => self.delete_selected(ctx),
+            Some(Click::Folder) => self.search_folder(ctx),
+            Some(Click::Sort(column)) => {
+                if self.query.sort_column == column {
+                    self.query.descending = !self.query.descending;
+                } else {
+                    self.query.sort_column = column;
+                    self.query.descending = false;
+                }
+                self.restart(ctx);
+            }
+            None => {}
+        }
+    }
+
+    fn status(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let shown = self.rows.len();
+        let text = if self.loading {
             "正在搜索…".into()
         } else if self.exporting {
             "正在导出全部结果…".into()
+        } else if self.deleting {
+            "正在删除…".into()
         } else if !self.note.is_empty() {
             self.note.clone()
+        } else if self.selection.rows.is_empty() {
+            format!("{} 个对象", grouped(self.total))
         } else {
-            let selected = self.table.read(cx).delegate().selected.len();
-            if selected == 0 {
-                format!("{} 个对象", self.total)
-            } else {
-                format!("{} 个对象 · 已选 {selected}", self.total)
-            }
+            format!(
+                "{} 个对象，已选择 {}",
+                grouped(self.total),
+                grouped(self.selection.rows.len())
+            )
         };
-
-        v_flex()
-            .size_full()
-            .key_context("Everything")
-            .track_focus(&self.focus)
-            .font_family("Microsoft YaHei UI")
-            .text_size(px(13.))
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .on_action(cx.listener(Self::open))
-            .on_action(cx.listener(Self::reveal))
-            .on_action(cx.listener(Self::copy_path))
-            .on_action(cx.listener(Self::search_folder))
-            .on_action(cx.listener(Self::focus_search))
-            .on_action(cx.listener(Self::export))
-            .on_action(cx.listener(Self::refresh))
-            .on_action(cx.listener(Self::delete))
-            .on_action(cx.listener(Self::select_all))
-            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, _| {
-                if event.button == MouseButton::Left {
-                    this.click = Some(event.modifiers);
+        ui.style_mut().visuals.override_text_color = Some(egui::Color32::BLACK);
+        ui.horizontal(|ui| {
+            ui.label(text);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let next =
+                    !self.loading && self.query.offset.saturating_add(PAGE_SIZE) < self.total;
+                let prev = !self.loading && self.query.offset > 0;
+                let plain = |label: &str| egui::Button::new(label).frame(false);
+                if ui.add_enabled(next, plain("下一页")).clicked() {
+                    self.page(true, &ctx);
                 }
-            }))
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.click = None;
-                let key = event.keystroke.key.as_ref();
-                if event.keystroke.modifiers.shift
-                    && !event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.alt
-                    && matches!(key, "up" | "down")
-                    && this.table.focus_handle(cx).is_focused(window)
-                {
-                    this.nudge(if key == "up" { -1 } else { 1 }, cx);
+                if ui.add_enabled(prev, plain("上一页")).clicked() {
+                    self.page(false, &ctx);
                 }
-            }))
-            .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
-            .on_action(cx.listener(|this, _: &PreviousPage, _, cx| this.page(false, cx)))
-            .on_action(cx.listener(|this, _: &NextPage, _, cx| this.page(true, cx)))
-            .on_action(cx.listener(|this, _: &AddBookmark, _, cx| this.bookmark(false, cx)))
-            .on_action(cx.listener(|this, _: &RemoveBookmark, _, cx| this.bookmark(true, cx)))
-            .on_action(cx.listener(|this, _: &MatchCase, _, cx| {
-                this.query.match_case = !this.query.match_case;
-                this.restart(cx);
-            }))
-            .on_action(cx.listener(|this, _: &MatchPath, _, cx| {
-                this.query.match_path = !this.query.match_path;
-                this.restart(cx);
-            }))
-            .on_action(cx.listener(|this, _: &WholeWord, _, cx| {
-                this.query.whole_word = !this.query.whole_word;
-                this.restart(cx);
-            }))
-            .on_action(cx.listener(|this, _: &Regex, _, cx| {
-                this.query.regex = !this.query.regex;
-                this.restart(cx);
-            }))
-            .on_action(cx.listener(|_, _: &ToggleTheme, window, cx| {
-                let mode = if cx.theme().is_dark() {
-                    ThemeMode::Light
-                } else {
-                    ThemeMode::Dark
-                };
-                Theme::change(mode, Some(window), cx);
-            }))
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(self.menu(
-                        "file-menu",
-                        "文件",
-                        {
-                            let focus = focus.clone();
-                            move |menu, _, _| {
-                                menu.action_context(focus.clone())
-                                    .menu("打开", Box::new(Open))
-                                    .menu("打开所在目录", Box::new(Reveal))
-                                    .separator()
-                                    .menu("导出全部结果 CSV…", Box::new(Export))
-                                    .separator()
-                                    .menu("退出", Box::new(Quit))
-                            }
-                        },
-                        cx,
-                    ))
-                    .child(self.menu(
-                        "edit-menu",
-                        "编辑",
-                        {
-                            let focus = focus.clone();
-                            move |menu, _, _| {
-                                menu.action_context(focus.clone())
-                                    .menu("复制完整路径", Box::new(CopyPath))
-                                    .menu("搜索此目录", Box::new(SearchFolder))
-                                    .separator()
-                                    .menu("定位搜索框", Box::new(FocusSearch))
-                            }
-                        },
-                        cx,
-                    ))
-                    .child(self.menu(
-                        "search-menu",
-                        "搜索",
-                        {
-                            let focus = focus.clone();
-                            move |menu, _, _| {
-                                menu.action_context(focus.clone())
-                                    .menu_with_check(
-                                        "区分大小写",
-                                        options.match_case,
-                                        Box::new(MatchCase),
-                                    )
-                                    .menu_with_check(
-                                        "匹配完整路径",
-                                        options.match_path,
-                                        Box::new(MatchPath),
-                                    )
-                                    .menu_with_check(
-                                        "全字匹配",
-                                        options.whole_word,
-                                        Box::new(WholeWord),
-                                    )
-                                    .menu_with_check("正则表达式", options.regex, Box::new(Regex))
-                            }
-                        },
-                        cx,
-                    ))
-                    .child(self.menu(
-                        "view-menu",
-                        "视图",
-                        {
-                            let focus = focus.clone();
-                            move |menu, _, _| {
-                                menu.action_context(focus.clone())
-                                    .menu("刷新", Box::new(Refresh))
-                                    .menu("切换深色／浅色", Box::new(ToggleTheme))
-                            }
-                        },
-                        cx,
-                    ))
-                    .child(self.menu(
-                        "bookmarks-menu",
-                        "书签",
-                        move |menu, _, _| {
-                            let mut menu = menu
-                                .action_context(focus.clone())
-                                .menu("收藏当前搜索", Box::new(AddBookmark))
-                                .menu("移除当前书签", Box::new(RemoveBookmark))
-                                .separator();
-                            for saved in &bookmarks {
-                                let query = saved.clone();
-                                let view = view.clone();
-                                let label = format!(
-                                    "{} · {}",
-                                    saved.filter.label(),
-                                    if saved.text.is_empty() {
-                                        "全部对象"
-                                    } else {
-                                        &saved.text
-                                    }
-                                );
-                                menu = menu.item(PopupMenuItem::new(label).on_click(
-                                    move |_, window, cx| {
-                                        let _ = view.update(cx, |this, cx| {
-                                            this.use_bookmark(query.clone(), window, cx);
-                                        });
-                                    },
-                                ));
-                            }
-                            menu
-                        },
-                        cx,
-                    ))
-                    .child(self.menu(
-                        "help-menu",
-                        "帮助",
-                        |menu, _, _| {
-                            menu.label("Everything Rust · GPUI")
-                                .link(
-                                    "Everything 搜索语法",
-                                    "https://www.voidtools.com/support/everything/searching/",
-                                )
-                                .link("GPUI", "https://gpui.rs/")
-                        },
-                        cx,
-                    )),
-            )
-            .child(
-                h_flex()
-                    .px_2()
-                    .pt_2()
-                    .gap_1()
-                    .children(Filter::ALL.map(|filter| {
-                        Button::new(("filter", filter as usize))
-                            .small()
-                            .ghost()
-                            .label(filter.label())
-                            .selected(filter == self.query.filter)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.query.filter = filter;
-                                this.restart(cx);
-                            }))
-                    })),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .p_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Input::new(&self.input).cleanable(true)),
-                    )
-                    .child(
-                        Button::new("refresh")
-                            .small()
-                            .icon(IconName::Redo)
-                            .tooltip("刷新 · F5")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.refresh(&Refresh, window, cx)
-                            })),
-                    ),
-            )
-            .when_some(
-                self.error.clone().or(self.bookmark_error.clone()),
-                |view, error| {
-                    view.child(div().px_3().py_2().text_color(rgb(0xb42318)).child(error))
-                },
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .text_size(px(12.))
-                    .child(Table::new(&self.table).xsmall().bordered(false)),
-            )
-            .child(
-                h_flex()
-                    .gap_3()
-                    .px_3()
-                    .py_1()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .child(status)
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(selected.map_or_else(String::new, |entry| {
-                                entry.path().display().to_string()
-                            })),
-                    )
-                    .child(format!(
-                        "{}–{} / {}",
-                        if rows == 0 { 0 } else { self.query.offset + 1 },
-                        self.query.offset + rows,
-                        self.total
-                    ))
-                    .child(
-                        Button::new("previous")
-                            .small()
-                            .ghost()
-                            .label("上一页")
-                            .disabled(self.loading || self.query.offset == 0)
-                            .on_click(cx.listener(|this, _, _, cx| this.page(false, cx))),
-                    )
-                    .child(
-                        Button::new("next")
-                            .small()
-                            .ghost()
-                            .label("下一页")
-                            .disabled(
-                                self.loading
-                                    || self.query.offset.saturating_add(PAGE_SIZE) >= self.total,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| this.page(true, cx))),
-                    ),
-            )
+                ui.label(format!(
+                    "{}–{} / {}",
+                    grouped(if shown == 0 { 0 } else { self.query.offset + 1 }),
+                    grouped(self.query.offset + shown),
+                    grouped(self.total)
+                ));
+            });
+        });
     }
 }
 
-fn main() {
-    Application::new()
-        .with_assets(gpui_component_assets::Assets)
-        .run(|cx| {
-            gpui_component::init(cx);
-            Theme::change(ThemeMode::Light, None, cx);
-            cx.bind_keys([
-                KeyBinding::new("ctrl-f", FocusSearch, Some("Everything")),
-                KeyBinding::new("ctrl-l", FocusSearch, Some("Everything")),
-                KeyBinding::new("f5", Refresh, Some("Everything")),
-                KeyBinding::new("enter", Open, Some("Everything && Table")),
-                KeyBinding::new("alt-enter", Reveal, Some("Everything && Table")),
-                KeyBinding::new("ctrl-c", CopyPath, Some("Everything && Table")),
-                KeyBinding::new("ctrl-shift-c", CopyPath, Some("Everything")),
-                KeyBinding::new("ctrl-e", Export, Some("Everything")),
-                KeyBinding::new("ctrl-d", AddBookmark, Some("Everything")),
-                KeyBinding::new("pageup", PreviousPage, Some("Everything && Table")),
-                KeyBinding::new("pagedown", NextPage, Some("Everything && Table")),
-                KeyBinding::new("ctrl-q", Quit, Some("Everything")),
-                KeyBinding::new("delete", Delete, Some("Everything && Table")),
-                KeyBinding::new("ctrl-a", SelectAll, Some("Everything && Table")),
-            ]);
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            let bounds = Bounds::centered(None, size(px(1200.), px(760.)), cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(800.), px(480.))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Everything — Rust".into()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let view = cx.new(|cx| Everything::new(window, cx));
-                    cx.new(|cx| Root::new(view, window, cx))
-                },
+impl eframe::App for Everything {
+    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll(ctx);
+        self.keys(ctx);
+        let visuals = ctx.style().visuals.clone();
+        let bar = egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(2, 0))
+            .fill(visuals.panel_fill);
+        egui::TopBottomPanel::top("menu")
+            .frame(bar)
+            .show(ctx, |ui| self.menus(ui));
+        egui::TopBottomPanel::top("search")
+            .frame(
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(4, 3))
+                    .fill(visuals.panel_fill),
             )
-            .expect("无法创建 GPUI 窗口");
-            cx.activate(true);
+            .show_separator_line(false)
+            .show(ctx, |ui| self.search_bar(ui));
+        if let Some(error) = self.error.clone().or(self.bookmark_error.clone()) {
+            egui::TopBottomPanel::top("error")
+                .frame(
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(4, 0))
+                        .fill(visuals.panel_fill),
+                )
+                .show(ctx, |ui| {
+                    ui.colored_label(egui::Color32::from_rgb(180, 35, 24), error);
+                });
+        }
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(6, 1))
+                    .fill(egui::Color32::from_rgb(228, 228, 228)),
+            )
+            .show(ctx, |ui| self.status(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(visuals.panel_fill))
+            .show(ctx, |ui| self.table(ui));
+    }
+}
+
+fn style(ctx: &egui::Context, dark: bool) {
+    let mut fonts = egui::FontDefinitions::default();
+    // Everything leaves its font blank, so it uses Microsoft YaHei UI for Latin too.
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\msyh.ttc") {
+        let mut data = egui::FontData::from_owned(bytes);
+        data.index = 1;
+        fonts
+            .font_data
+            .insert("yahei".into(), data.into());
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .insert(0, "yahei".into());
+        }
+    }
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
+        fonts
+            .font_data
+            .insert("segoe".into(), egui::FontData::from_owned(bytes).into());
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push("segoe".into());
+        }
+    }
+    ctx.set_fonts(fonts);
+
+    let mut visuals = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    let bg = if dark {
+        egui::Color32::from_rgb(32, 32, 32)
+    } else {
+        egui::Color32::WHITE
+    };
+    let fg = if dark {
+        egui::Color32::from_gray(230)
+    } else {
+        egui::Color32::BLACK
+    };
+    let border = if dark {
+        egui::Color32::from_gray(90)
+    } else {
+        egui::Color32::from_rgb(171, 173, 179)
+    };
+    let header = if dark {
+        egui::Color32::from_rgb(45, 45, 45)
+    } else {
+        egui::Color32::from_rgb(240, 240, 240)
+    };
+    let hover = if dark {
+        egui::Color32::from_rgb(50, 70, 90)
+    } else {
+        egui::Color32::from_rgb(229, 243, 255)
+    };
+    visuals.dark_mode = dark;
+    visuals.panel_fill = bg;
+    visuals.window_fill = bg;
+    visuals.extreme_bg_color = bg;
+    visuals.faint_bg_color = header;
+    visuals.code_bg_color = bg;
+    visuals.window_corner_radius = egui::CornerRadius::ZERO;
+    visuals.menu_corner_radius = egui::CornerRadius::ZERO;
+    visuals.striped = false;
+    visuals.selection.bg_fill = egui::Color32::from_rgb(0, 120, 215);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0, 120, 215));
+    visuals.window_stroke = egui::Stroke::NONE;
+    visuals.widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(217, 217, 217));
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = egui::CornerRadius::ZERO;
+        widget.expansion = 0.0;
+        widget.fg_stroke = egui::Stroke::new(1.0_f32, fg);
+    }
+    visuals.widgets.inactive.weak_bg_fill = bg;
+    visuals.widgets.inactive.bg_fill = bg;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border);
+    visuals.widgets.hovered.weak_bg_fill = hover;
+    visuals.widgets.hovered.bg_fill = if dark {
+        egui::Color32::from_rgb(40, 48, 56)
+    } else {
+        egui::Color32::from_rgb(245, 250, 255)
+    };
+    visuals.widgets.hovered.bg_stroke = visuals.selection.stroke;
+    visuals.widgets.active.weak_bg_fill = hover;
+    visuals.widgets.active.bg_stroke = visuals.selection.stroke;
+    visuals.widgets.open.weak_bg_fill = bg;
+    if dark {
+        visuals.widgets.noninteractive.bg_stroke =
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60));
+    }
+    ctx.set_visuals(visuals);
+    ctx.style_mut(|style| {
+        // 9 pt, the Windows menu / Everything UI size at 96 DPI.
+        let body = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, body.clone());
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, body.clone());
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, body.clone());
+        style.text_styles.insert(egui::TextStyle::Heading, body);
+        style.spacing.item_spacing = egui::vec2(4.0, 1.0);
+        style.spacing.button_padding = egui::vec2(6.0, 1.0);
+        style.spacing.interact_size.y = 20.0;
+        style.spacing.menu_margin = egui::Margin::symmetric(2, 2);
+        style.spacing.window_margin = egui::Margin::ZERO;
+        style.spacing.scroll.bar_width = 12.0;
+        style.spacing.scroll.bar_inner_margin = 0.0;
+        style.spacing.scroll.bar_outer_margin = 0.0;
+        style.spacing.scroll.floating = false;
+    });
+}
+
+fn grouped(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn save_csv() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        use std::{ffi::OsString, os::windows::ffi::OsStrExt};
+        use windows::Win32::System::Com::{
+            CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+            CoUninitialize,
+        };
+        use windows::Win32::UI::Shell::{
+            FOS_OVERWRITEPROMPT, FileSaveDialog, IFileSaveDialog, SIGDN_FILESYSPATH,
+        };
+        use windows::core::{PCWSTR, w};
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let path = unsafe {
+                let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                let uninit = hr.is_ok();
+                let path = (|| {
+                    let dialog: IFileSaveDialog =
+                        CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL).ok()?;
+                    let name: Vec<u16> = OsString::from("everything-results.csv")
+                        .encode_wide()
+                        .chain([0])
+                        .collect();
+                    dialog.SetFileName(PCWSTR(name.as_ptr())).ok()?;
+                    dialog.SetDefaultExtension(w!("csv")).ok()?;
+                    dialog.SetOptions(FOS_OVERWRITEPROMPT).ok()?;
+                    dialog.Show(None).ok()?;
+                    let item = dialog.GetResult().ok()?;
+                    let wide = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+                    let len = (0..).take_while(|i| *wide.0.add(*i) != 0).count();
+                    let path = OsString::from_wide(std::slice::from_raw_parts(wide.0, len)).into();
+                    CoTaskMemFree(Some(wide.0.cast()));
+                    Some(path)
+                })();
+                if uninit {
+                    CoUninitialize();
+                }
+                path
+            };
+            let _ = tx.send(path);
         });
+        rx.recv().ok().flatten()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn hover_menu(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    label: &str,
+    open: &Rc<Cell<Option<&'static str>>>,
+    add: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let response = ui.add(egui::Button::new(label).frame(false));
+    let mut over = response.hovered();
+    if over {
+        open.set(Some(id));
+    }
+    if open.get() == Some(id)
+        && let Some(inner) = egui::Popup::menu(&response).open(true).show(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.set_min_width(220.0);
+            add(ui);
+        })
+    {
+        over |= inner.response.hovered();
+    }
+    ui.add_space(8.0);
+    over
+}
+
+fn menu_row(ui: &mut egui::Ui, label: &str, shortcut: &str) -> bool {
+    let width = ui.available_width().max(220.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+    ui.painter().text(
+        rect.left_center() + egui::vec2(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font.clone(),
+        ui.visuals().text_color(),
+    );
+    if !shortcut.is_empty() {
+        ui.painter().text(
+            rect.right_center() - egui::vec2(8.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            shortcut,
+            font,
+            ui.visuals().weak_text_color(),
+        );
+    }
+    response.clicked()
+}
+
+fn menu_check(ui: &mut egui::Ui, label: &str, shortcut: &str, value: &mut bool) -> bool {
+    let mark = if *value { "√  " } else { "    " };
+    if menu_row(ui, &format!("{mark}{label}"), shortcut) {
+        *value = !*value;
+        return true;
+    }
+    false
+}
+
+fn menu_mark(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
+    let mark = if on { "●  " } else { "    " };
+    menu_row(ui, &format!("{mark}{label}"), "")
+}
+
+fn size_text(size: Option<u64>) -> String {
+    let Some(size) = size else {
+        return String::new();
+    };
+    if size < 1024 {
+        return search::human_size(Some(size));
+    }
+    format!("{} KB", grouped((size / 1024) as usize))
+}
+
+fn date_text(raw: &str) -> String {
+    let text = raw.trim().replace('T', " ");
+    let mut parts = text.split([' ', '-', ':']);
+    let Some(year) = parts.next() else {
+        return text;
+    };
+    let Ok(month) = parts.next().unwrap_or("").parse::<u32>() else {
+        return text;
+    };
+    let Ok(day) = parts.next().unwrap_or("").parse::<u32>() else {
+        return text;
+    };
+    let Ok(hour) = parts.next().unwrap_or("").parse::<u32>() else {
+        return format!("{year}/{month}/{day}");
+    };
+    let Ok(minute) = parts.next().unwrap_or("").parse::<u32>() else {
+        return format!("{year}/{month}/{day}");
+    };
+    format!("{year}/{month}/{day} {hour:02}:{minute:02}")
+}
+
+fn open_path(path: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("cmd")
+            .args(["/C", "start", "", &path.display().to_string()])
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+fn reveal_path(path: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let parent = path.parent().unwrap_or(path);
+        let _ = Command::new("xdg-open").arg(parent).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Selection;
+
+    #[test]
+    fn everything_text_format() {
+        assert_eq!(super::size_text(Some(4_294_967_296)), "4,194,304 KB");
+        assert_eq!(super::size_text(Some(66)), "66 B");
+        assert_eq!(super::date_text("2026-10-05T18:55:01"), "2026/10/5 18:55");
+    }
+
+    #[test]
+    fn ctrl_and_shift_selection() {
+        let mut selection = Selection::default();
+        selection.select(1);
+        selection.toggle(3);
+        assert_eq!(selection.rows.iter().copied().collect::<Vec<_>>(), [1, 3]);
+        selection.extend(4);
+        assert_eq!(selection.cursor, Some(4));
+        assert_eq!(selection.rows.iter().copied().collect::<Vec<_>>(), [3, 4]);
+        selection.all(5);
+        assert_eq!(selection.rows.len(), 5);
+        assert_eq!(selection.cursor, Some(4));
+        selection.move_to(-3, 5);
+        assert_eq!(selection.cursor, Some(1));
+        assert_eq!(selection.rows.iter().copied().collect::<Vec<_>>(), [1]);
+        selection.nudge(2, 5);
+        assert_eq!(
+            selection.rows.iter().copied().collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        selection.clear();
+        assert!(selection.rows.is_empty());
+    }
+
+    #[test]
+    fn thousands_separator() {
+        assert_eq!(super::grouped(0), "0");
+        assert_eq!(super::grouped(999), "999");
+        assert_eq!(super::grouped(3_332_278), "3,332,278");
+    }
 }

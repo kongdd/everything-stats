@@ -1,11 +1,11 @@
 //! Windows shell icons, loaded off the UI thread and shared by file type.
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use gpui::RenderImage;
+use image::RgbaImage;
 
 use crate::search::Entry;
 
-pub type Cache = HashMap<String, Option<Arc<RenderImage>>>;
+pub type Cache = HashMap<String, Option<Arc<RgbaImage>>>;
 
 pub fn key(entry: &Entry) -> String {
     if entry.folder {
@@ -23,6 +23,18 @@ pub fn key(entry: &Entry) -> String {
         return format!("path:{}", entry.path().display());
     }
     format!("ext:{extension}")
+}
+
+pub fn fetch(entry: &Entry) -> Option<Arc<RgbaImage>> {
+    #[cfg(windows)]
+    {
+        shell::fetch(entry, key(entry).starts_with("path:"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = entry;
+        None
+    }
 }
 
 pub fn load(rows: &[Entry], mut cache: Cache) -> Cache {
@@ -54,7 +66,7 @@ pub fn load(rows: &[Entry], mut cache: Cache) -> Cache {
 mod shell {
     use std::{mem::size_of, os::windows::ffi::OsStrExt, ptr};
 
-    use image::{Frame, RgbaImage};
+    use image::RgbaImage;
     use windows::{
         Win32::{
             Graphics::Imaging::*,
@@ -90,11 +102,23 @@ mod shell {
         unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }.ok()
     }
 
+    pub fn fetch(entry: &Entry, own_icon: bool) -> Option<Arc<RgbaImage>> {
+        thread_local! {
+            static LOCAL: std::cell::RefCell<Option<(Com, Option<IWICImagingFactory>)>> =
+                std::cell::RefCell::new(None);
+        }
+        LOCAL.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let local = slot.get_or_insert_with(|| (Com::new(), factory()));
+            local.1.as_ref().and_then(|factory| load(entry, own_icon, factory))
+        })
+    }
+
     pub fn load(
         entry: &Entry,
         own_icon: bool,
         factory: &IWICImagingFactory,
-    ) -> Option<Arc<RenderImage>> {
+    ) -> Option<Arc<RgbaImage>> {
         let path = if own_icon {
             entry.path()
         } else {
@@ -106,11 +130,13 @@ mod shell {
         } else {
             FILE_ATTRIBUTE_NORMAL
         };
-        let flags = if own_icon {
-            SHGFI_ICON
-        } else {
-            SHGFI_ICON | SHGFI_USEFILEATTRIBUTES
-        };
+        let flags = SHGFI_ICON
+            | SHGFI_SMALLICON
+            | if own_icon {
+                SHGFI_FLAGS(0)
+            } else {
+                SHGFI_USEFILEATTRIBUTES
+            };
         let mut info = SHFILEINFOW::default();
         unsafe {
             if SHGetFileInfoW(
@@ -146,8 +172,10 @@ mod shell {
                 converter
                     .CopyPixels(ptr::null(), width * 4, &mut pixels)
                     .ok()?;
-                let buffer = RgbaImage::from_raw(width, height, pixels)?;
-                Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
+                for pixel in pixels.chunks_exact_mut(4) {
+                    pixel.swap(0, 2); // BGRA -> RGBA
+                }
+                Some(Arc::new(RgbaImage::from_raw(width, height, pixels)?))
             })();
             let _ = DestroyIcon(info.hIcon);
             image
@@ -187,14 +215,15 @@ mod tests {
         {
             for row in &rows {
                 let icon = cache[&key(row)].as_ref().expect("Windows shell icon");
-                let size = icon.size(0);
-                let pixels = icon.as_bytes(0).unwrap();
-                assert_eq!(pixels.len(), (size.width.0 * size.height.0 * 4) as usize);
-                assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+                assert_eq!(
+                    icon.as_raw().len(),
+                    (icon.width() * icon.height() * 4) as usize
+                );
+                assert!(icon.as_raw().chunks_exact(4).any(|pixel| pixel[3] != 0));
             }
             assert_ne!(
-                cache[&key(&rows[0])].as_ref().unwrap().as_bytes(0),
-                cache[&key(&rows[2])].as_ref().unwrap().as_bytes(0)
+                cache[&key(&rows[0])].as_ref().unwrap().as_raw(),
+                cache[&key(&rows[2])].as_ref().unwrap().as_raw()
             );
         }
         let full = (0..1025).map(|index| (index.to_string(), None)).collect();
