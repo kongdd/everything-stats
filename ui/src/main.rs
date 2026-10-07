@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod es;
 mod icons;
 mod search;
 
@@ -114,6 +115,8 @@ enum Click {
     Sort(usize),
 }
 
+type Icon = (String, Option<std::sync::Arc<image::RgbaImage>>);
+
 enum Job {
     Deleted(anyhow::Result<bool>, usize),
     Exported(anyhow::Result<PathBuf>),
@@ -130,7 +133,7 @@ struct Everything {
     deleting: bool,
     revision: u64,
     search_rx: Option<(u64, Receiver<anyhow::Result<search::Page>>)>,
-    icon_rx: Option<(u64, Receiver<(String, Option<std::sync::Arc<image::RgbaImage>>)>)>,
+    icon_rx: Option<(u64, Receiver<Icon>)>,
     job_rx: Option<Receiver<Job>>,
     textures: std::collections::HashMap<String, Option<TextureHandle>>,
     icon_cache: icons::Cache,
@@ -463,33 +466,29 @@ impl Everything {
             }
         }
 
-        if let Some((revision, rx)) = self.icon_rx.take() {
-            if revision == self.revision {
-                loop {
-                    match rx.try_recv() {
-                        Ok((key, image)) => {
-                            if !self.textures.contains_key(&key) {
-                                let handle = image.as_ref().map(|image| {
-                                    let color = ColorImage::from_rgba_unmultiplied(
-                                        [image.width() as usize, image.height() as usize],
-                                        image.as_raw(),
-                                    );
-                                    ctx.load_texture(
-                                        key.clone(),
-                                        color,
-                                        TextureOptions::LINEAR,
-                                    )
-                                });
-                                self.textures.insert(key.clone(), handle);
-                            }
-                            self.icon_cache.insert(key, image);
+        if let Some((revision, rx)) = self.icon_rx.take()
+            && revision == self.revision
+        {
+            loop {
+                match rx.try_recv() {
+                    Ok((key, image)) => {
+                        if !self.textures.contains_key(&key) {
+                            let handle = image.as_ref().map(|image| {
+                                let color = ColorImage::from_rgba_unmultiplied(
+                                    [image.width() as usize, image.height() as usize],
+                                    image.as_raw(),
+                                );
+                                ctx.load_texture(key.clone(), color, TextureOptions::LINEAR)
+                            });
+                            self.textures.insert(key.clone(), handle);
                         }
-                        Err(TryRecvError::Empty) => {
-                            self.icon_rx = Some((revision, rx));
-                            break;
-                        }
-                        Err(TryRecvError::Disconnected) => break,
+                        self.icon_cache.insert(key, image);
                     }
+                    Err(TryRecvError::Empty) => {
+                        self.icon_rx = Some((revision, rx));
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => break,
                 }
             }
         }
@@ -769,10 +768,7 @@ impl Everything {
             ui.painter()
                 .circle_stroke(center + egui::vec2(-2.0, -1.0), 4.5, stroke);
             ui.painter().line_segment(
-                [
-                    center + egui::vec2(1.5, 2.2),
-                    center + egui::vec2(4.8, 5.5),
-                ],
+                [center + egui::vec2(1.5, 2.2), center + egui::vec2(4.8, 5.5)],
                 stroke,
             );
             if response.changed() {
@@ -1136,9 +1132,7 @@ fn style(ctx: &egui::Context, dark: bool) {
     if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\msyh.ttc") {
         let mut data = egui::FontData::from_owned(bytes);
         data.index = 1;
-        fonts
-            .font_data
-            .insert("yahei".into(), data.into());
+        fonts.font_data.insert("yahei".into(), data.into());
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             fonts
                 .families
@@ -1152,7 +1146,11 @@ fn style(ctx: &egui::Context, dark: bool) {
             .font_data
             .insert("segoe".into(), egui::FontData::from_owned(bytes).into());
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().push("segoe".into());
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("segoe".into());
         }
     }
     ctx.set_fonts(fonts);

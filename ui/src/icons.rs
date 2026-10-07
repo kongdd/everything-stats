@@ -37,6 +37,7 @@ pub fn fetch(entry: &Entry) -> Option<Arc<RgbaImage>> {
     }
 }
 
+#[cfg(test)]
 pub fn load(rows: &[Entry], mut cache: Cache) -> Cache {
     // ponytail: batch eviction above 1024 icons; use LRU only if cache misses become costly.
     if cache.len() > 1024 {
@@ -102,15 +103,18 @@ mod shell {
         unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }.ok()
     }
 
+    #[allow(clippy::missing_const_for_thread_local)]
     pub fn fetch(entry: &Entry, own_icon: bool) -> Option<Arc<RgbaImage>> {
         thread_local! {
-            static LOCAL: std::cell::RefCell<Option<(Com, Option<IWICImagingFactory>)>> =
-                std::cell::RefCell::new(None);
+            static LOCAL: std::cell::RefCell<Option<(Com, Option<IWICImagingFactory>)>> = const { std::cell::RefCell::new(None) };
         }
         LOCAL.with(|slot| {
             let mut slot = slot.borrow_mut();
             let local = slot.get_or_insert_with(|| (Com::new(), factory()));
-            local.1.as_ref().and_then(|factory| load(entry, own_icon, factory))
+            local
+                .1
+                .as_ref()
+                .and_then(|factory| load(entry, own_icon, factory))
         })
     }
 
