@@ -146,10 +146,43 @@ struct Everything {
     from_search: bool,
     menu: Option<&'static str>,
     follow: bool,
+    cols: [f32; 5],
 }
 
 impl Everything {
     fn new(cc: &eframe::CreationContext) -> Self {
+        #[cfg(windows)]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            use windows::Win32::{
+                Foundation::HWND,
+                Graphics::Dwm::{DWMWA_BORDER_COLOR, DwmSetWindowAttribute},
+                UI::WindowsAndMessaging::{SW_MAXIMIZE, ShowWindow},
+            };
+            if let Ok(handle) = cc.window_handle()
+                && let RawWindowHandle::Win32(handle) = handle.as_raw()
+            {
+                let hwnd = HWND(handle.hwnd.get() as _);
+                // `ViewportBuilder::with_maximized` maximizes before winit knows the
+                // monitor and leaves the default size plus an unpainted frame on the right.
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                };
+                // Match the native title bar instead of leaving a dark non-client strip.
+                let color = 0x00f3f3f3_u32;
+                if let Err(error) = unsafe {
+                    DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_BORDER_COLOR,
+                        &color as *const _ as _,
+                        std::mem::size_of_val(&color) as _,
+                    )
+                } {
+                    // Border colors are unsupported on Windows 10; keep its native frame.
+                    eprintln!("Cannot set window border color: {error}");
+                }
+            }
+        }
         style(&cc.egui_ctx, false);
         cc.egui_ctx
             .memory_mut(|memory| memory.request_focus(egui::Id::new("search")));
@@ -181,6 +214,7 @@ impl Everything {
             from_search: false,
             menu: None,
             follow: false,
+            cols: [280.0, 120.0, 72.0, 84.0, 148.0],
         };
         app.start_search(&cc.egui_ctx);
         app
@@ -785,23 +819,33 @@ impl Everything {
 
     fn table(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        // Keep partially scrolled rows from bleeding into the fixed header.
+        ui.visuals_mut().clip_rect_margin = 0.0;
         // Idle column rules are full-height; Everything only hints them in the header.
         ui.visuals_mut().widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
         let event = Rc::new(Cell::new(None::<Click>));
         let n = self.rows.len();
         let selection = self.selection.clone();
+        let table_rect = ui.available_rect_before_wrap();
+        // The header reaches the panel's right edge, including the scroll bar gutter.
+        let header_rect =
+            egui::Rect::from_min_size(table_rect.min, egui::vec2(table_rect.width(), 24.0));
+        ui.painter()
+            .rect_filled(header_rect, 0.0, ui.visuals().faint_bg_color);
+        let available = ui.available_width() - ui.spacing().scroll.allocated_width();
+        let mut widths = fit_columns(self.cols, available);
         let mut table = TableBuilder::new(ui)
-            .id_salt("header-28")
+            .id_salt("cols")
             .striped(false)
-            .resizable(true)
+            .resizable(false)
             .vscroll(true)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .auto_shrink([false, false])
             .sense(egui::Sense::click())
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(280.0).at_least(80.0).clip(true))
-            .column(Column::remainder().at_least(120.0).clip(true))
-            .column(Column::initial(72.0).at_least(48.0).clip(true))
-            .column(Column::initial(84.0).at_least(56.0).clip(true))
-            .column(Column::initial(148.0).at_least(120.0).clip(true));
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+        for width in widths {
+            table = table.column(Column::exact(width));
+        }
         if self.follow
             && let Some(row) = self.selection.cursor
         {
@@ -824,7 +868,7 @@ impl Everything {
                         } else if resp.hovered() {
                             ui.visuals().widgets.hovered.weak_bg_fill
                         } else {
-                            ui.visuals().faint_bg_color
+                            egui::Color32::TRANSPARENT
                         };
                         ui.painter().rect_filled(rect, 0.0, bg);
                         let (align, pos) = if index == 3 {
@@ -886,6 +930,23 @@ impl Everything {
                 });
             });
         self.apply_click(event.get(), ui.ctx());
+        let mut x = table_rect.left();
+        for (index, width) in widths.into_iter().take(4).enumerate() {
+            x += width;
+            let handle = egui::Rect::from_x_y_ranges((x - 3.0)..=(x + 3.0), table_rect.y_range());
+            let resp = ui.interact(
+                handle,
+                ui.id().with("col").with(index),
+                egui::Sense::click_and_drag(),
+            );
+            if resp.hovered() || resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+            }
+            if resp.dragged() {
+                drag_column(&mut widths, index, resp.drag_delta().x);
+                self.cols = widths;
+            }
+        }
     }
 
     fn draw_cell(
@@ -1097,7 +1158,12 @@ impl eframe::App for Everything {
         egui::TopBottomPanel::top("search")
             .frame(
                 egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(4, 3))
+                    .inner_margin(egui::Margin {
+                        left: 4,
+                        right: 0,
+                        top: 3,
+                        bottom: 3,
+                    })
                     .fill(visuals.panel_fill),
             )
             .show_separator_line(false)
@@ -1211,15 +1277,25 @@ fn style(ctx: &egui::Context, dark: bool) {
         widget.fg_stroke = egui::Stroke::new(1.0_f32, fg);
     }
     visuals.widgets.inactive.weak_bg_fill = bg;
-    visuals.widgets.inactive.bg_fill = bg;
+    // The scroll handle is painted with these fills (see `foreground_color` below).
+    visuals.widgets.inactive.bg_fill = if dark {
+        egui::Color32::from_gray(90)
+    } else {
+        egui::Color32::from_gray(205)
+    };
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border);
     visuals.widgets.hovered.weak_bg_fill = hover;
     visuals.widgets.hovered.bg_fill = if dark {
-        egui::Color32::from_rgb(40, 48, 56)
+        egui::Color32::from_gray(115)
     } else {
-        egui::Color32::from_rgb(245, 250, 255)
+        egui::Color32::from_gray(185)
     };
     visuals.widgets.hovered.bg_stroke = visuals.selection.stroke;
+    visuals.widgets.active.bg_fill = if dark {
+        egui::Color32::from_gray(140)
+    } else {
+        egui::Color32::from_gray(160)
+    };
     visuals.widgets.active.weak_bg_fill = hover;
     visuals.widgets.active.bg_stroke = visuals.selection.stroke;
     visuals.widgets.open.weak_bg_fill = bg;
@@ -1246,10 +1322,14 @@ fn style(ctx: &egui::Context, dark: bool) {
         style.spacing.interact_size.y = 20.0;
         style.spacing.menu_margin = egui::Margin::symmetric(2, 2);
         style.spacing.window_margin = egui::Margin::ZERO;
+        // egui paints the scroll handle with `fg_stroke` (the near-black text color
+        // here) while `foreground_color` is set, which read as a black band down the
+        // right edge of the list. Use the light gray widget fills instead.
+        style.spacing.scroll = egui::style::ScrollStyle::solid();
+        style.spacing.scroll.foreground_color = false;
         style.spacing.scroll.bar_width = 12.0;
         style.spacing.scroll.bar_inner_margin = 0.0;
         style.spacing.scroll.bar_outer_margin = 0.0;
-        style.spacing.scroll.floating = false;
     });
 }
 
@@ -1415,6 +1495,31 @@ fn date_text(raw: &str) -> String {
     format!("{year}/{month}/{day} {hour:02}:{minute:02}")
 }
 
+const COLUMN_MIN: [f32; 5] = [80.0, 120.0, 48.0, 56.0, 120.0];
+
+fn fit_columns(mut width: [f32; 5], available: f32) -> [f32; 5] {
+    // The path column takes the slack, then the wide columns give back what is missing.
+    let fixed = width[0] + width[2] + width[3] + width[4];
+    width[1] = (available - fixed).max(COLUMN_MIN[1]);
+    let mut over = (width.iter().sum::<f32>() - available).max(0.0);
+    for index in [4, 3, 2, 0] {
+        let give = (width[index] - COLUMN_MIN[index]).max(0.0).min(over);
+        width[index] -= give;
+        over -= give;
+    }
+    width
+}
+
+fn drag_column(widths: &mut [f32; 5], index: usize, dx: f32) {
+    // Shift the divider between `index` and `index + 1`, within both minimums.
+    let dx = dx.clamp(
+        COLUMN_MIN[index] - widths[index],
+        widths[index + 1] - COLUMN_MIN[index + 1],
+    );
+    widths[index] += dx;
+    widths[index + 1] -= dx;
+}
+
 fn open_path(path: &Path) {
     #[cfg(windows)]
     {
@@ -1448,7 +1553,7 @@ fn reveal_path(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::Selection;
+    use super::{Selection, drag_column, fit_columns};
 
     #[test]
     fn everything_text_format() {
@@ -1479,6 +1584,35 @@ mod tests {
         );
         selection.clear();
         assert!(selection.rows.is_empty());
+    }
+
+    #[test]
+    fn columns_fill_and_resize() {
+        let widths = [280.0, 120.0, 72.0, 84.0, 148.0];
+        for available in [424.0, 600.0, 1200.0, 2400.0] {
+            let before = fit_columns(widths, available);
+            assert_eq!(before.iter().sum::<f32>(), available);
+            for index in 0..4 {
+                for dx in [-10_000.0_f32, -16.0, 16.0, 10_000.0] {
+                    let mut after = before;
+                    drag_column(&mut after, index, dx);
+                    assert_eq!(fit_columns(after, available), after);
+                    let delta = dx.clamp(
+                        super::COLUMN_MIN[index] - before[index],
+                        before[index + 1] - super::COLUMN_MIN[index + 1],
+                    );
+                    assert_eq!(after[index], before[index] + delta);
+                    assert_eq!(after[index + 1], before[index + 1] - delta);
+                    assert_eq!(after.iter().sum::<f32>(), available);
+                    for column in 0..5 {
+                        assert!(after[column] >= super::COLUMN_MIN[column]);
+                        if column != index && column != index + 1 {
+                            assert_eq!(after[column], before[column]);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
