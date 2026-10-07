@@ -649,7 +649,7 @@ impl Everything {
         let ctx = ui.ctx().clone();
         let open = Rc::new(Cell::new(self.menu));
         let mut over = false;
-        egui::MenuBar::new()
+        let bar = egui::MenuBar::new()
             .style(|style: &mut egui::Style| {
                 style.spacing.button_padding = egui::vec2(6.0, 1.0);
                 style.spacing.item_spacing.x = 2.0;
@@ -772,6 +772,11 @@ impl Everything {
                     );
                 });
             });
+        // Stay open while the pointer is on the bar (the gaps between the titles
+        // included) or inside the open menu.
+        over |= ctx
+            .pointer_hover_pos()
+            .is_some_and(|pos| bar.response.rect.contains(pos));
         if !over {
             open.set(None);
         }
@@ -1158,12 +1163,7 @@ impl eframe::App for Everything {
         egui::TopBottomPanel::top("search")
             .frame(
                 egui::Frame::new()
-                    .inner_margin(egui::Margin {
-                        left: 4,
-                        right: 0,
-                        top: 3,
-                        bottom: 3,
-                    })
+                    .inner_margin(egui::Margin::symmetric(3, 3))
                     .fill(visuals.panel_fill),
             )
             .show_separator_line(false)
@@ -1417,7 +1417,12 @@ fn hover_menu(
             add(ui);
         })
     {
-        over |= inner.response.hovered();
+        // Hovering an item keeps the hover on that item, never on the popup itself.
+        let rect = inner.response.rect;
+        over |= ui
+            .ctx()
+            .pointer_hover_pos()
+            .is_some_and(|pos| rect.contains(pos));
     }
     ui.add_space(8.0);
     over
